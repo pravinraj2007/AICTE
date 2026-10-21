@@ -1,0 +1,7 @@
+{
+  "name": "AICTE Intelligent Regulatory Validation Platform",
+  "description": "AI-powered regulatory compliance verification, document authentication, OCR extraction, anomaly detection, and reviewer workflow portal for AICTE applications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

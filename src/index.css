@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+  --color-primary-navy: #15345b;
+  --color-deep-navy: #0b1f3a;
+  --color-accent-teal: #0f8b8d;
+  --color-canvas: #f4f7fb;
+  --color-surface: #ffffff;
+  --color-text-main: #172b4d;
+  --color-text-sub: #64748b;
+  --color-border-subtle: #e2e8f0;
+  --color-gov-success: #16845b;
+  --color-gov-warning: #b7791f;
+  --color-gov-danger: #c03945;
+  --color-gov-info: #2563eb;
+}
+
+:root {
+  --primary-navy: #15345B;
+  --deep-navy: #0B1F3A;
+  --accent-teal: #0F8B8D;
+  --canvas-bg: #F4F7FB;
+  --surface-bg: #FFFFFF;
+  --text-main: #172B4D;
+  --text-sub: #64748B;
+  --border-line: #E2E8F0;
+  --status-success: #16845B;
+  --status-warning: #B7791F;
+  --status-danger: #C03945;
+  --status-info: #2563EB;
+}
+
+body {
+  background-color: var(--canvas-bg);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures for amounts, PIDs, dates and counts */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Accessible focus rings */
+:focus-visible {
+  outline: 2px solid #0F8B8D;
+  outline-offset: 2px;
+}
+
+/* Custom crisp scrollbar for data tables and split panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
