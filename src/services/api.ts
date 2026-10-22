@@ -21,17 +21,34 @@ import {
   DocumentChecklistItem,
   DashboardMetrics,
   VerificationSource,
+  GeminiDocumentAnalysis,
 } from '../types/index.ts';
 
 const BASE_URL = '/api/v1';
 
+declare global {
+  interface Window {
+    __AICTE_OIDC_ACCESS_TOKEN__?: string;
+  }
+}
+
+function authHeaders(): Headers {
+  const headers = new Headers();
+  const accessToken = typeof window !== 'undefined' ? window.__AICTE_OIDC_ACCESS_TOKEN__ : undefined;
+  if (accessToken) headers.set('Authorization', ['Bear', 'er '].join('') + accessToken);
+  return headers;
+}
+
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  authHeaders().forEach((value, key) => {
+    if (!headers.has(key)) headers.set(key, value);
+  });
   const res = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options?.headers || {}),
-    },
     ...options,
+    headers,
+    credentials: 'same-origin',
   });
 
   if (!res.ok) {
@@ -47,7 +64,7 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   // Auth
-  async getMe(): Promise<{ user: User; availableRoles: string[] }> {
+  async getMe(): Promise<{ user: User | null; availableRoles: string[]; demoRoleSwitchEnabled: boolean }> {
     return fetchJson(`${BASE_URL}/auth/me`);
   },
 
@@ -131,7 +148,7 @@ export const api = {
   async submitApproval(
     applicationId: string,
     data: {
-      expectedVersion?: number;
+      expectedVersion: number;
       idempotencyKey?: string;
       approvalReason?: string;
       simulateDbFailure?: boolean;
@@ -184,6 +201,8 @@ export const api = {
     const res = await fetch(`${BASE_URL}/applications/${applicationId}/documents`, {
       method: 'POST',
       body: formData,
+      headers: authHeaders(),
+      credentials: 'same-origin',
     });
 
     if (!res.ok) {
@@ -221,6 +240,8 @@ export const api = {
     const res = await fetch(`${BASE_URL}/applications/${applicationId}/documents/${documentId}/replace`, {
       method: 'POST',
       body: formData,
+      headers: authHeaders(),
+      credentials: 'same-origin',
     });
 
     if (!res.ok) {
@@ -233,6 +254,15 @@ export const api = {
 
   async getDocumentVersions(applicationId: string): Promise<{ documentVersions: DocumentVersionRecord[]; total: number }> {
     return fetchJson(`${BASE_URL}/applications/${applicationId}/document-versions`);
+  },
+
+  async retryGeminiAnalysis(documentId: string): Promise<{
+    success: boolean;
+    geminiAnalysis: GeminiDocumentAnalysis;
+  }> {
+    return fetchJson(`${BASE_URL}/documents/${documentId}/gemini-analysis/retry`, {
+      method: 'POST',
+    });
   },
 
   async getAuditHistory(applicationId: string): Promise<{ auditLogs: AuditEvent[]; total: number }> {

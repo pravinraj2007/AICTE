@@ -81,6 +81,10 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
   const [uploadType, setUploadType] = useState('FIRE_NOC');
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [uploadFeedback, setUploadFeedback] = useState('');
+  const [retryingGeminiDocumentId, setRetryingGeminiDocumentId] = useState<string | null>(null);
+  const [geminiRetryErrors, setGeminiRetryErrors] = useState<Record<string, string>>({});
   const [replacementReason, setReplacementReason] = useState('');
   const [replaceAmount, setReplaceAmount] = useState('3500000');
   const [replaceExpiry, setReplaceExpiry] = useState('2029-05-14');
@@ -167,16 +171,52 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
     e.preventDefault();
     if (!detailApp || !uploadFile) return;
 
+    const extension = uploadFile.name.toLowerCase().slice(uploadFile.name.lastIndexOf('.'));
+    const supportedTypes: Record<string, string> = {
+      '.pdf': 'application/pdf',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+    };
+    if (!supportedTypes[extension] || uploadFile.type !== supportedTypes[extension]) {
+      setUploadError('Choose a PDF, PNG, or JPEG document.');
+      return;
+    }
+    if (uploadFile.size === 0 || uploadFile.size > 25 * 1024 * 1024) {
+      setUploadError('Choose a file larger than 0 bytes and no larger than 25 MB.');
+      return;
+    }
+
     try {
       setUploading(true);
-      await api.uploadDocument(detailApp.id, uploadFile, uploadType);
+      setUploadError('');
+      const result = await api.uploadDocument(detailApp.id, uploadFile, uploadType);
+      setUploadFeedback(`${result.document.originalFilename} uploaded successfully.`);
       setShowUploadModal(false);
       setUploadFile(null);
-      loadApplicationDetail(detailApp.id);
-    } catch (err: any) {
-      alert('Upload failed: ' + err.message);
+      await loadApplicationDetail(detailApp.id);
+    } catch (err) {
+      setUploadError(`Upload failed: ${err instanceof Error ? err.message : 'Unexpected error'}`);
     } finally {
       setUploading(false);
+    }
+  };
+
+  const handleGeminiRetry = async (documentId: string) => {
+    if (!detailApp) return;
+    setRetryingGeminiDocumentId(documentId);
+    setGeminiRetryErrors((errors) => ({ ...errors, [documentId]: '' }));
+    try {
+      await api.retryGeminiAnalysis(documentId);
+      await loadApplicationDetail(detailApp.id);
+    } catch (error) {
+      setGeminiRetryErrors((errors) => ({
+        ...errors,
+        [documentId]: error instanceof Error ? error.message : 'Analysis retry failed.',
+      }));
+      await loadApplicationDetail(detailApp.id);
+    } finally {
+      setRetryingGeminiDocumentId(null);
     }
   };
 
@@ -353,7 +393,15 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
           <div className="pt-3 border-t border-slate-100 grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px]">
             <div className="p-2 bg-slate-50 rounded border border-slate-200">
               <div className="text-slate-400">Document Processing</div>
-              <div className="font-semibold text-slate-800 mt-0.5">SHA-256 Hashed & OCR'd</div>
+              <div className="font-semibold text-slate-800 mt-0.5">
+                {documents.length === 0
+                  ? 'No documents'
+                  : documents.some((doc) => doc.processingStatus === 'MANUAL_REVIEW_REQUIRED')
+                  ? 'Manual review required'
+                  : documents.every((doc) => doc.processingStatus === 'PROCESSED')
+                  ? 'Text extraction complete'
+                  : 'Processing incomplete'}
+              </div>
             </div>
             <div className="p-2 bg-slate-50 rounded border border-slate-200">
               <div className="text-slate-400">Authenticity Verification</div>
@@ -409,11 +457,13 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
             <div className="flex items-center gap-2">
               <Clock className="w-5 h-5 text-red-600 shrink-0" />
               <h3 className="text-sm font-bold">
-                Urgent Action Required: Financial Instrument Matures Today (2026-10-21)
+                Financial Instrument Flagged as Maturing Today
               </h3>
             </div>
             <p className="text-xs text-red-900 leading-relaxed">
-              Statutory Fixed Deposit Receipt reaches maturity at 23:59:59 UTC today. An idempotent escalation task has been generated for the regional scrutiny committee. Pledged funds must be rolled over with joint endorsement.
+              {primaryFdr?.maturityDate
+                ? `The loaded instrument record lists a maturity date of ${primaryFdr.maturityDate}. Review the source evidence and applicable requirements; this prototype does not confirm an official escalation or rollover.`
+                : 'The application is flagged as maturing today, but no linked instrument date is available. Review the source evidence before taking action.'}
             </p>
           </div>
         )}
@@ -494,9 +544,19 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
               <p className="text-xs text-slate-500">
                 Replace any defective upload with a new immutable version without overwriting historical audit records.
               </p>
+              {uploadFeedback && (
+                <p className="mt-2 text-xs text-emerald-700" role="status">
+                  {uploadFeedback}
+                </p>
+              )}
             </div>
             <button
-              onClick={() => setShowUploadModal(true)}
+              onClick={() => {
+                setUploadFile(null);
+                setUploadError('');
+                setUploadFeedback('');
+                setShowUploadModal(true);
+              }}
               className="px-3 py-1.5 text-xs font-semibold text-white bg-[#0f294a] hover:bg-[#163a66] rounded flex items-center gap-1.5"
             >
               <Upload className="w-3.5 h-3.5" /> Upload Document
@@ -518,6 +578,11 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
                         <span className="text-[10px] bg-slate-200 text-slate-700 font-bold px-1.5 py-0.2 rounded font-mono">
                           v{doc.version}
                         </span>
+                        {doc.isSimulated && (
+                          <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-1.5 py-0.2 rounded">
+                            SIMULATED DATA
+                          </span>
+                        )}
                         {doc.authenticityStatus && (
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
                             doc.authenticityStatus === 'VERIFIED'
@@ -552,16 +617,158 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
 
                 {/* Extracted Details & SHA-256 */}
                 <div className="bg-white p-3 rounded border border-slate-200 text-[11px] grid grid-cols-1 sm:grid-cols-2 gap-2 text-slate-700">
-                  {doc.extractedFields.financialAmount && (
-                    <div>FDR Amount: <strong className="tabular-nums font-mono">INR {doc.extractedFields.financialAmount.toLocaleString()}</strong></div>
+                  <div>
+                    Native extraction status: <strong>{doc.processingStatus.replace(/_/g, ' ')}</strong>
+                    {' · '}Extraction Method: <strong>{doc.extractedFields.extractionMethod.replace(/_/g, ' ')}</strong>
+                    {' · '}Confidence: <strong>
+                      {typeof doc.extractedFields.extractionConfidence === 'number'
+                        ? `${(doc.extractedFields.extractionConfidence * 100).toFixed(0)}%`
+                        : 'Not reported'}
+                    </strong>
+                  </div>
+                  {doc.processingPages?.map((page) => (
+                    <div key={`${doc.id}-page-${page.page}`}>
+                      Page {page.page}: <strong>{page.status.replace(/_/g, ' ')}</strong>
+                      {' · '}{page.method.replace(/_/g, ' ')}
+                    </div>
+                  ))}
+                  {Object.entries(doc.extractedFields)
+                    .filter(([field, value]) =>
+                      value !== undefined &&
+                      !['rawTextPreview', 'extractionMethod', 'extractionConfidence'].includes(field)
+                    )
+                    .map(([field, value]) => (
+                      <div key={`${doc.id}-native-${field}`}>
+                        {field.replace(/([A-Z])/g, ' $1')}: <strong>
+                          {Array.isArray(value)
+                            ? value.join(', ')
+                            : typeof value === 'number'
+                            ? value.toLocaleString()
+                            : String(value)}
+                        </strong>
+                      </div>
+                    ))}
+                  {doc.extractedFields.rawTextPreview && (
+                    <div className="sm:col-span-2">
+                      <div className="text-slate-500 font-medium mb-1">Extracted text preview</div>
+                      <pre className="whitespace-pre-wrap break-words font-sans">{doc.extractedFields.rawTextPreview}</pre>
+                    </div>
                   )}
-                  {doc.extractedFields.fdrNumber && (
-                    <div>FDR Number: <strong className="font-mono">{doc.extractedFields.fdrNumber}</strong></div>
+                  {doc.fieldEvidence && Object.entries(doc.fieldEvidence).length > 0 && (
+                    <div className="sm:col-span-2">
+                      <div className="text-slate-500 font-medium mb-1">Native extraction source evidence</div>
+                      {Object.entries(doc.fieldEvidence).map(([field, evidence]) => (
+                        <div key={field} className="mb-1">
+                          <strong>{field.replace(/([A-Z])/g, ' $1')}:</strong>{' '}
+                          {evidence.map((item) => `Page ${item.page}: ${item.text}`).join(' · ')}
+                        </div>
+                      ))}
+                    </div>
                   )}
-                  {doc.extractedFields.expiryDate && (
-                    <div>Maturity / Expiry: <strong className="font-mono">{doc.extractedFields.expiryDate}</strong></div>
-                  )}
-                  <div>Extraction Method: <strong>{doc.extractedFields.extractionMethod}</strong> (Confidence: {((doc.extractedFields.extractionConfidence || 0.95) * 100).toFixed(0)}%)</div>
+                  <div className="sm:col-span-2 rounded border border-violet-200 bg-violet-50/50 p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="font-semibold text-violet-950">Gemini document analysis</div>
+                        <div className="text-violet-800">
+                          Status: <strong>{(doc.geminiAnalysis?.status || 'PENDING').replace(/_/g, ' ')}</strong>
+                          {doc.geminiAnalysis?.model ? ` · ${doc.geminiAnalysis.model}` : ''}
+                          {doc.geminiAnalysis?.analyzedAt
+                            ? ` · ${new Date(doc.geminiAnalysis.analyzedAt).toLocaleString()}`
+                            : ''}
+                        </div>
+                      </div>
+                      {doc.mimeType === 'application/pdf' &&
+                        !doc.isSimulated &&
+                        doc.processingStatus === 'PROCESSED' &&
+                        doc.geminiAnalysis?.status !== 'COMPLETED' && (
+                        <button
+                          type="button"
+                          onClick={() => handleGeminiRetry(doc.id)}
+                          disabled={retryingGeminiDocumentId === doc.id}
+                          className="shrink-0 px-2.5 py-1 text-[11px] font-semibold text-violet-800 bg-white hover:bg-violet-100 rounded border border-violet-200 disabled:opacity-50"
+                        >
+                          {retryingGeminiDocumentId === doc.id ? 'Retrying…' : 'Retry analysis'}
+                        </button>
+                      )}
+                    </div>
+                    {doc.geminiAnalysis?.errorCode && (
+                      <div className="text-amber-800" role="status">
+                        Analysis detail: {doc.geminiAnalysis.errorCode.replace(/_/g, ' ').toLowerCase()}.
+                      </div>
+                    )}
+                    {geminiRetryErrors[doc.id] && (
+                      <div className="text-red-700" role="alert">{geminiRetryErrors[doc.id]}</div>
+                    )}
+                    {doc.geminiAnalysis?.result && (
+                      <div className="space-y-2">
+                        <div className="text-[10px] text-violet-900 font-medium">
+                          AI interpretation only; it does not replace native extraction, source evidence, or deterministic regulatory findings.
+                        </div>
+                        {doc.geminiAnalysis.inputTextTruncated && (
+                          <div className="text-amber-800">
+                            Only the first 40,000 characters were sent for AI analysis; later document text was not analyzed.
+                          </div>
+                        )}
+                        {[
+                          { label: 'Document type', value: doc.geminiAnalysis.result.documentType, sourceField: null },
+                          { label: 'Institution name', value: doc.geminiAnalysis.result.institutionName, sourceField: 'institutionName' as const },
+                          { label: 'Certificate number', value: doc.geminiAnalysis.result.certificateNumber, sourceField: 'registrationNumber' as const },
+                          { label: 'Issuing authority', value: doc.geminiAnalysis.result.issuingAuthority, sourceField: 'issuingAuthority' as const },
+                          { label: 'Issue date', value: doc.geminiAnalysis.result.issueDate, sourceField: 'issueDate' as const },
+                          { label: 'Expiry date', value: doc.geminiAnalysis.result.expiryDate, sourceField: 'expiryDate' as const },
+                        ].map(({ label, value, sourceField }) => {
+                          const extractedValue = sourceField ? doc.extractedFields[sourceField] : undefined;
+                          const matchedEvidence =
+                            sourceField && typeof extractedValue === 'string' && extractedValue === value
+                              ? doc.fieldEvidence?.[sourceField] || []
+                              : [];
+                          return (
+                            <div key={label}>
+                              <strong>{label}:</strong> {value || 'Not identified'}
+                              {value && sourceField && typeof extractedValue === 'string' && extractedValue === value && (
+                                <div className="text-emerald-800">
+                                  Matches native extraction{matchedEvidence.length === 0 ? '; source evidence is unavailable.' : ':'}
+                                  {matchedEvidence.map((item, index) => (
+                                    <div key={`${label}-evidence-${index}`}>
+                                      Page {item.page}: {item.text}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              {value && sourceField && typeof extractedValue === 'string' && extractedValue !== value && (
+                                <div className="text-amber-800">
+                                  AI interpretation differs from the native extracted value; review against source evidence.
+                                </div>
+                              )}
+                              {value && sourceField && typeof extractedValue !== 'string' && (
+                                <div className="text-violet-800">
+                                  AI interpretation; no direct native extracted value or supporting evidence is available.
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                        {doc.geminiAnalysis.result.missingFields.length > 0 && (
+                          <div>
+                            <strong>Missing or unidentified fields:</strong>{' '}
+                            {doc.geminiAnalysis.result.missingFields.join(' · ')}
+                          </div>
+                        )}
+                        {doc.geminiAnalysis.result.inconsistencies.length > 0 && (
+                          <div>
+                            <strong>Potential inconsistencies:</strong>{' '}
+                            {doc.geminiAnalysis.result.inconsistencies.join(' · ')}
+                          </div>
+                        )}
+                        {doc.geminiAnalysis.result.warnings.length > 0 && (
+                          <div>
+                            <strong>Warnings:</strong> {doc.geminiAnalysis.result.warnings.join(' · ')}
+                          </div>
+                        )}
+                        <div><strong>Summary:</strong> {doc.geminiAnalysis.result.summary}</div>
+                      </div>
+                    )}
+                  </div>
                   <div className="sm:col-span-2 text-slate-400 font-mono text-[10px] break-all">
                     SHA-256: {doc.sha256Hash}
                   </div>
@@ -620,6 +827,89 @@ export const ApplicationsView: React.FC<ApplicationsViewProps> = ({
             ))}
           </div>
         </div>
+
+        {/* Modal: Upload Document */}
+        {showUploadModal && (
+          <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-white rounded-lg shadow-xl max-w-lg w-full border border-slate-200 p-6 space-y-4">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">Upload Application Document</h3>
+                  <p className="text-xs text-slate-500">
+                    Supported formats: PDF, PNG, and JPEG up to 25 MB. Embedded PDF text is extracted from the file. Scanned pages require Tesseract OCR; when it is unavailable or cannot read a page, the document is marked for manual review instead of receiving guessed values.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowUploadModal(false)}
+                  className="text-slate-400 hover:text-slate-600 text-lg"
+                  aria-label="Close upload dialog"
+                >
+                  &times;
+                </button>
+              </div>
+
+              <form onSubmit={handleUploadSubmit} className="space-y-4 text-xs">
+                <div>
+                  <label htmlFor="upload-document-type" className="block font-medium text-slate-700 mb-1">Document Type</label>
+                  <select
+                    id="upload-document-type"
+                    value={uploadType}
+                    onChange={(e) => setUploadType(e.target.value)}
+                    className="w-full p-2 border border-slate-300 rounded"
+                  >
+                    <option value="LAND_DOC">Land Document</option>
+                    <option value="BUILDING_PLAN">Building Plan</option>
+                    <option value="FIRE_NOC">Fire NOC</option>
+                    <option value="OCCUPANCY_CERT">Occupancy Certificate</option>
+                    <option value="POLLUTION_NOC">Pollution NOC</option>
+                    <option value="AFFILIATION_LETTER">Affiliation Letter</option>
+                    <option value="AICTE_PREVIOUS_EOA">Previous AICTE EOA</option>
+                    <option value="FACULTY_LIST">Faculty List</option>
+                    <option value="FDR_OR_ENDOWMENT">FDR or Endowment</option>
+                    <option value="INFRASTRUCTURE_PHOTO">Infrastructure Photo</option>
+                    <option value="OTHER_EVIDENCE">Other Evidence</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="upload-document-file" className="block font-medium text-slate-700 mb-1">Select File</label>
+                  <input
+                    id="upload-document-file"
+                    type="file"
+                    accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
+                    required
+                    onChange={(e) => {
+                      setUploadFile(e.target.files?.[0] || null);
+                      setUploadError('');
+                    }}
+                    className="w-full text-slate-600 text-xs file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                  />
+                </div>
+
+                {uploadError && <p className="text-red-700" role="alert">{uploadError}</p>}
+
+                <div className="flex justify-end gap-2 pt-2 border-t">
+                  <button
+                    type="button"
+                    onClick={() => setShowUploadModal(false)}
+                    disabled={uploading}
+                    className="px-3 py-1.5 text-slate-600 hover:bg-slate-100 rounded disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={uploading || !uploadFile}
+                    className="px-4 py-1.5 bg-[#0f294a] text-white font-semibold rounded disabled:opacity-50"
+                  >
+                    {uploading ? 'Uploading…' : 'Upload Document'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
 
         {/* Modal: Replace Document Version (Scenario 9) */}
         {showReplaceModal && targetReplaceDoc && (

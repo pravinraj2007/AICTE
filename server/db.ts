@@ -21,8 +21,44 @@ import {
   ValidationRuleConfig,
   DocumentChecklistItem,
   DashboardMetrics,
+  VerificationResult,
 } from '../src/types/index.ts';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { DatabaseSync } from 'node:sqlite';
+
+const DATABASE_PATH = path.resolve(
+  process.env.AICTE_DATABASE_PATH ||
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data', 'aicte.sqlite')
+);
+
+type PersistedState = Pick<
+  DatabaseStore,
+  | 'users'
+  | 'institutions'
+  | 'applications'
+  | 'documents'
+  | 'documentVersions'
+  | 'fdrInstruments'
+  | 'validationRuns'
+  | 'validationFindings'
+  | 'verificationAttempts'
+  | 'reviewerActions'
+  | 'escalationTasks'
+  | 'approvalCommands'
+  | 'auditEvents'
+  | 'rules'
+  | 'checklists'
+>;
+
+export class PersistenceConflictError extends Error {
+  constructor() {
+    super('Application state changed in durable storage.');
+    this.name = 'PersistenceConflictError';
+  }
+}
 
 export class DatabaseStore {
   users: User[] = [];
@@ -40,9 +76,135 @@ export class DatabaseStore {
   auditEvents: AuditEvent[] = [];
   rules: ValidationRuleConfig[] = [];
   checklists: DocumentChecklistItem[] = [];
+  private readonly database: DatabaseSync;
 
   constructor() {
     this.seedAll();
+    fs.mkdirSync(path.dirname(DATABASE_PATH), { recursive: true });
+    this.database = new DatabaseSync(DATABASE_PATH);
+    this.database.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA foreign_keys = ON;
+      PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS platform_state (
+        service TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS platform_records (
+        service TEXT NOT NULL,
+        collection TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        application_id TEXT,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (service, collection, record_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_platform_records_application
+        ON platform_records (service, application_id, collection);
+      CREATE INDEX IF NOT EXISTS idx_platform_records_document
+        ON platform_records (service, json_extract(payload, '$.documentId'));
+      CREATE INDEX IF NOT EXISTS idx_platform_records_sha256
+        ON platform_records (service, json_extract(payload, '$.sha256Hash'));
+      CREATE INDEX IF NOT EXISTS idx_platform_records_audit_target
+        ON platform_records (service, json_extract(payload, '$.targetId'));
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_platform_committed_idempotency
+        ON platform_records (service, json_extract(payload, '$.idempotencyKey'))
+        WHERE collection = 'approvalCommands' AND json_extract(payload, '$.status') = 'COMMITTED';
+      CREATE TABLE IF NOT EXISTS platform_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    this.database
+      .prepare('INSERT OR IGNORE INTO platform_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+      .run(1, 'shared-json-state-and-record-indexes', new Date().toISOString());
+    const stored = this.database
+      .prepare('SELECT payload FROM platform_state WHERE service = ?')
+      .get('express') as { payload: string } | undefined;
+    if (stored) {
+      this.restore(JSON.parse(stored.payload) as PersistedState);
+    } else {
+      this.persist();
+    }
+  }
+
+  snapshot(): PersistedState {
+    return JSON.parse(JSON.stringify({
+      users: this.users,
+      institutions: this.institutions,
+      applications: this.applications,
+      documents: this.documents,
+      documentVersions: this.documentVersions,
+      fdrInstruments: this.fdrInstruments,
+      validationRuns: this.validationRuns,
+      validationFindings: this.validationFindings,
+      verificationAttempts: this.verificationAttempts,
+      reviewerActions: this.reviewerActions,
+      escalationTasks: this.escalationTasks,
+      approvalCommands: this.approvalCommands,
+      auditEvents: this.auditEvents,
+      rules: this.rules,
+      checklists: this.checklists,
+    })) as PersistedState;
+  }
+
+  restore(state: PersistedState): void {
+    Object.assign(this, state);
+  }
+
+  persist(expectedApplicationVersions: Record<string, number> = {}): void {
+    const state = this.snapshot();
+    const payload = JSON.stringify(state);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      if (Object.keys(expectedApplicationVersions).length > 0) {
+        const stored = this.database
+          .prepare('SELECT payload FROM platform_state WHERE service = ?')
+          .get('express') as { payload: string } | undefined;
+        const storedApplications = stored
+          ? (JSON.parse(stored.payload) as PersistedState).applications
+          : [];
+        for (const [applicationId, expectedVersion] of Object.entries(expectedApplicationVersions)) {
+          const storedVersion = storedApplications.find((application) => application.id === applicationId)?.version;
+          if (storedVersion !== expectedVersion) throw new PersistenceConflictError();
+        }
+      }
+      this.database
+        .prepare(`
+          INSERT INTO platform_state (service, payload, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(service) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+        `)
+        .run('express', payload, new Date().toISOString());
+      this.database.prepare('DELETE FROM platform_records WHERE service = ?').run('express');
+      const insertRecord = this.database.prepare(`
+        INSERT INTO platform_records (service, collection, record_id, application_id, payload)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const [collection, records] of Object.entries(state)) {
+        if (!Array.isArray(records)) continue;
+        for (const record of records) {
+          const recordId = record && typeof record === 'object' ? record.id : undefined;
+          if (typeof recordId !== 'string' || !recordId) continue;
+          const applicationId =
+            'applicationId' in record && typeof record.applicationId === 'string'
+              ? record.applicationId
+              : collection === 'applications'
+                ? record.id
+                : null;
+          insertRecord.run('express', collection, recordId, applicationId, JSON.stringify(record));
+        }
+      }
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  close(): void {
+    this.database.close();
   }
 
   seedAll() {
@@ -1194,6 +1356,16 @@ export class DatabaseStore {
       MINOR: 0,
       INFORMATIONAL: 0,
     };
+    const verificationOutcomes: Record<VerificationResult, number> = {
+      VERIFIED_BY_AUTHORIZED_SOURCE: 0,
+      MISMATCH_DETECTED: 0,
+      EXPIRED: 0,
+      PENDING: 0,
+      SOURCE_UNAVAILABLE: 0,
+      MANUAL_REVIEW_REQUIRED: 0,
+      UNSUPPORTED_VERIFICATION_METHOD: 0,
+      VERIFIED_IN_SIMULATION: 0,
+    };
 
     for (const app of this.applications) {
       appsByStatus[app.status] = (appsByStatus[app.status] || 0) + 1;
@@ -1206,6 +1378,10 @@ export class DatabaseStore {
       }
     }
 
+    for (const verification of this.verificationAttempts) {
+      verificationOutcomes[verification.result] += 1;
+    }
+
     const openCount = this.validationFindings.filter(
       (f) => f.status === 'OPEN' || f.status === 'CONFIRMED_DISCREPANCY' || f.status === 'REASSESSMENT_REQUIRED'
     ).length;
@@ -1214,14 +1390,17 @@ export class DatabaseStore {
     const avgScore =
       completedScores.length > 0
         ? Math.round(completedScores.reduce((a, b) => a + b, 0) / completedScores.length)
-        : 78;
+        : null;
 
     return {
       totalApplications: this.applications.length,
+      institutionCount: this.institutions.length,
+      potentialAnomaliesCount: 0,
       applicationsByStatus: appsByStatus as any,
       applicationsByCategory: appsByCategory as any,
       openFindingsCount: openCount,
       findingsBySeverity: findingsBySeverity as any,
+      verificationOutcomes,
       pendingVerifications: this.verificationAttempts.filter((v) => v.result === 'PENDING').length,
       applicationsRequiringReview: this.applications.filter(
         (a) =>
@@ -1232,7 +1411,7 @@ export class DatabaseStore {
       ).length,
       completedValidations: this.validationRuns.length,
       averageComplianceScore: avgScore,
-      syntheticDataNotice: 'Synthetic Demonstration Dataset (10 Institutes, Seeded FDRs, Escalations & Audit Logs)',
+      syntheticDataNotice: `Synthetic Demonstration Dataset (${this.institutions.length} Institutes, Seeded FDRs, Escalations & Audit Logs)`,
       openEscalationsCount: this.escalationTasks.filter((e) => e.status === 'OPEN').length,
       duplicateConflictCount: this.applications.filter((a) => a.status === 'DUPLICATE_CONFLICT_REVIEW').length,
     };

@@ -28,6 +28,7 @@ import { User, UserRole } from '../../types/index.ts';
 
 interface AppShellProps {
   currentUser: User | null;
+  demoRoleSwitchEnabled: boolean;
   onUserChanged: (u: User) => void;
   activeNav: string;
   onNavigate: (navId: string) => void;
@@ -39,11 +40,12 @@ interface AppShellProps {
 
 export const AppShell: React.FC<AppShellProps> = ({
   currentUser,
+  demoRoleSwitchEnabled,
   onUserChanged,
   activeNav,
   onNavigate,
   breadcrumbs = ['AICTE Portal', 'Dashboard'],
-  unreadNotificationCount = 3,
+  unreadNotificationCount = 0,
   onOpenNewApplication,
   children,
 }) => {
@@ -71,7 +73,7 @@ export const AppShell: React.FC<AppShellProps> = ({
       canApprove: false,
     },
     {
-      id: 'usr-reviewer-1',
+      id: 'usr-rev-1',
       name: 'Dr. Sunil K. Mehta',
       email: 'scrutiny.officer@aicte.gov.in',
       role: 'REVIEWER',
@@ -79,7 +81,7 @@ export const AppShell: React.FC<AppShellProps> = ({
       canApprove: true,
     },
     {
-      id: 'usr-reviewer-2',
+      id: 'usr-rev-2',
       name: 'Er. Pooja Verma',
       email: 'assistant.reviewer@aicte.gov.in',
       role: 'REVIEWER',
@@ -87,7 +89,7 @@ export const AppShell: React.FC<AppShellProps> = ({
       canApprove: false,
     },
     {
-      id: 'usr-admin-1',
+      id: 'usr-adm-1',
       name: 'Smt. Shailaja R.',
       email: 'director.approval@aicte.gov.in',
       role: 'ADMIN',
@@ -270,11 +272,11 @@ export const AppShell: React.FC<AppShellProps> = ({
                 <div className="text-sm font-bold tracking-tight text-white flex items-center gap-2">
                   <span>AICTE Regulatory Intelligence</span>
                   <span className="hidden sm:inline-block text-[10px] font-normal uppercase tracking-wider bg-white/10 px-1.5 py-0.5 rounded text-teal-200">
-                    Official Scrutiny Portal
+                    Prototype
                   </span>
                 </div>
                 <div className="text-[10px] text-slate-300 hidden md:block">
-                  Regulation Bureau · Approval Process Handbook Compliance
+                  AI-assisted regulatory document validation demonstration
                 </div>
               </div>
             </div>
@@ -329,8 +331,8 @@ export const AppShell: React.FC<AppShellProps> = ({
               {notificationsOpen && (
                 <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-xl border border-slate-200 text-slate-900 z-50 animate-in fade-in-50">
                   <div className="p-3 border-b border-slate-100 flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-900">Regulatory Notifications</span>
-                    <span className="text-[10px] text-slate-500">3 Unread Alerts</span>
+                    <span className="text-xs font-bold text-slate-900">Demonstration Notifications</span>
+                    <span className="text-[10px] text-slate-500">Seeded examples</span>
                   </div>
                   <div className="divide-y divide-slate-100 text-xs">
                     <div
@@ -342,10 +344,10 @@ export const AppShell: React.FC<AppShellProps> = ({
                     >
                       <div className="font-semibold text-rose-700 flex items-center gap-1">
                         <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                        <span>Duplicate FDR Conflict Detected</span>
+                        <span>Sample Duplicate FDR Finding</span>
                       </div>
                       <p className="text-slate-600 text-[11px]">
-                        FDR #SBIFDR991024 is simultaneously pledged in Delhi and Bangalore submissions.
+                        Example duplicate-instrument finding from seeded prototype records.
                       </p>
                     </div>
                     <div
@@ -357,10 +359,10 @@ export const AppShell: React.FC<AppShellProps> = ({
                     >
                       <div className="font-semibold text-amber-700 flex items-center gap-1">
                         <Clock className="w-3.5 h-3.5 shrink-0" />
-                        <span>FDR Expires Today</span>
+                        <span>Sample Maturity Alert</span>
                       </div>
                       <p className="text-slate-600 text-[11px]">
-                        Jaipur Institute FDR matures on 2026-10-21. Rollover certificate required.
+                        Example maturity alert from seeded prototype records; live notification service is not connected.
                       </p>
                     </div>
                     <div
@@ -384,6 +386,7 @@ export const AppShell: React.FC<AppShellProps> = ({
             </div>
 
             {/* Quick Role Switcher Button */}
+            {demoRoleSwitchEnabled && (
             <div className="relative">
               <button
                 onClick={() => setRoleSwitcherOpen(!roleSwitcherOpen)}
@@ -453,6 +456,7 @@ export const AppShell: React.FC<AppShellProps> = ({
                 </div>
               )}
             </div>
+            )}
           </div>
         </div>
       </header>

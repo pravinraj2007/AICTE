@@ -14,7 +14,7 @@ import {
   Search,
   Lock,
 } from 'lucide-react';
-import { FdrInstrument, User, Application } from '../types/index.ts';
+import { FdrInstrument, User, Application, ValidationFinding } from '../types/index.ts';
 import { api } from '../services/api.ts';
 import { StatusBadge } from './common/StatusBadge.tsx';
 
@@ -29,6 +29,7 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
 }) => {
   const [fdrInstruments, setFdrInstruments] = useState<FdrInstrument[]>([]);
   const [applications, setApplications] = useState<Application[]>([]);
+  const [validationFindings, setValidationFindings] = useState<ValidationFinding[]>([]);
   const [loading, setLoading] = useState(true);
   const [verifyingDocId, setVerifyingDocId] = useState<string | null>(null);
   const [simulatedMode, setSimulatedMode] = useState<'TIMEOUT' | 'SUCCESS'>('TIMEOUT');
@@ -43,9 +44,11 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
 
       // Fetch all application records to aggregate all FDR instruments
       const allInstruments: FdrInstrument[] = [];
+      const allFindings: ValidationFinding[] = [];
       for (const a of appsRes.applications) {
         try {
           const detail = await api.getApplicationById(a.id);
+          allFindings.push(...detail.findings);
           if (detail.fdrInstruments && detail.fdrInstruments.length > 0) {
             allInstruments.push(...detail.fdrInstruments);
           }
@@ -54,6 +57,7 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
         }
       }
       setFdrInstruments(allInstruments);
+      setValidationFindings(allFindings);
     } catch (err) {
       console.error('Failed to load FDR instruments', err);
     } finally {
@@ -103,6 +107,19 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
       inst.fdrNumberNormalized.toLowerCase().includes(q)
     );
   });
+  const instrumentGroups = new Map<string, FdrInstrument[]>();
+  for (const instrument of fdrInstruments) {
+    const group = instrumentGroups.get(instrument.fdrNumberNormalized) || [];
+    group.push(instrument);
+    instrumentGroups.set(instrument.fdrNumberNormalized, group);
+  }
+  const duplicateGroups = Array.from(instrumentGroups.values()).filter((group) => group.length > 1);
+  const duplicateInstrumentIds = new Set(duplicateGroups.flatMap((group) => group.map((item) => item.id)));
+  const firstDuplicateGroup = duplicateGroups[0];
+  const firstShortfall = validationFindings.find(
+    (finding) => finding.financialShortfall && finding.financialShortfall.shortfall > 0
+  );
+  const expiringToday = fdrInstruments.filter((instrument) => instrument.isExpiringToday);
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -174,9 +191,13 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
             </span>
             <span className="text-[10px] font-mono text-slate-500">RULE-08</span>
           </div>
-          <div className="text-lg font-bold text-slate-900">1 Active Collision</div>
+          <div className="text-lg font-bold text-slate-900">
+            {duplicateGroups.length} Active Collision{duplicateGroups.length === 1 ? '' : 's'}
+          </div>
           <p className="text-[11px] text-slate-600 leading-relaxed">
-            Normalized FDR <strong>SBIFDR991024</strong> is detected under <em>different filenames</em> in Delhi (<span className="font-mono text-[10px]">delhi_fd_receipt.pdf</span>) and Bangalore (<span className="font-mono text-[10px]">bangalore_fixed_deposit_scan.pdf</span>).
+            {firstDuplicateGroup
+              ? `A repeated normalized instrument reference is present in ${firstDuplicateGroup.length} loaded records. Review linked applications; matching hashes or identifiers are not proof of fraud.`
+              : 'No repeated normalized instrument references were found in the currently loaded records.'}
           </p>
           <div className="text-[10px] font-semibold text-rose-700 bg-rose-50 p-1.5 rounded">
             Status: DUPLICATE_CONFLICT_REVIEW (Approval Blocked)
@@ -192,9 +213,16 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
             </span>
             <span className="text-[10px] font-mono text-slate-500">RULE-07</span>
           </div>
-          <div className="text-lg font-bold text-slate-900">Matures Today (2026-10-21)</div>
+          <div className="text-lg font-bold text-slate-900">
+            {expiringToday.length} Instrument{expiringToday.length === 1 ? '' : 's'} Flagged Today
+          </div>
           <p className="text-[11px] text-slate-600 leading-relaxed">
-            PNB Endowment FDR for Jaipur Institute reaches statutory maturity on the current business date. Unencumbered guarantee ceases today.
+            {expiringToday.length > 0
+              ? expiringToday.map((instrument) => {
+                  const institutionName = applications.find((item) => item.id === instrument.applicationId)?.institutionName || 'Institution unavailable';
+                  return `${institutionName}: maturity ${instrument.maturityDate}.`;
+                }).join(' ' )
+              : 'No loaded financial instruments are currently flagged as maturing today.'}
           </p>
           <div className="text-[10px] font-semibold text-amber-800 bg-amber-50 p-1.5 rounded">
             Status: EXPIRING_TODAY (Rollover Mandatory)
@@ -210,9 +238,15 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
             </span>
             <span className="text-[10px] font-mono text-slate-500">RULE-06</span>
           </div>
-          <div className="text-lg font-bold text-slate-900">INR 700,000 Deficit</div>
+          <div className="text-lg font-bold text-slate-900">
+            {firstShortfall
+              ? `${firstShortfall.financialShortfall?.currency} ${firstShortfall.financialShortfall?.shortfall.toLocaleString()} Deficit`
+              : 'No loaded shortfall finding'}
+          </div>
           <p className="text-[11px] text-slate-600 leading-relaxed">
-            Statutory requirement: INR 3,500,000. Verified amount: INR 2,800,000. Exact integer-cents arithmetic calculation without IEEE-754 drift.
+            {firstShortfall?.financialShortfall
+              ? `Finding ${firstShortfall.ruleId}: required ${firstShortfall.financialShortfall.currency} ${firstShortfall.financialShortfall.requiredAmount.toLocaleString()}, recorded amount ${firstShortfall.financialShortfall.verifiedAmount.toLocaleString()}.`
+              : 'Shortfall figures are shown only when present in loaded validation findings.'}
           </p>
           <div className="text-[10px] font-semibold text-slate-700 bg-slate-100 p-1.5 rounded">
             Deficit: max(0, required - verified)
@@ -229,10 +263,10 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
             <span className="text-[10px] font-mono text-slate-500">API Gateway</span>
           </div>
           <div className="text-xs font-semibold text-slate-800">
-            Circuit Breaker: <span className="font-mono text-emerald-600">CLOSED</span> (Healthy)
+            Provider status: <span className="font-mono text-amber-700">Simulation only</span>
           </div>
           <p className="text-[11px] text-slate-500 leading-relaxed">
-            Protected with bounded backoff (3 retries). Timeout transitions state to SOURCE_UNAVAILABLE and never marks verified.
+            No live bank connection is configured. The controls below exercise simulated success and timeout responses only.
           </p>
           <div className="flex items-center gap-2 pt-1">
             <select
@@ -294,7 +328,7 @@ export const FdrVerificationView: React.FC<FdrVerificationViewProps> = ({
                 </tr>
               ) : (
                 filteredInstruments.map((inst) => {
-                  const isCollision = inst.fdrNumberNormalized === 'SBIFDR991024';
+                  const isCollision = duplicateInstrumentIds.has(inst.id);
                   const isExpiringToday = inst.isExpiringToday;
                   const app = applications.find((a) => a.id === inst.applicationId);
 

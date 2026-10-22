@@ -76,12 +76,13 @@ export class AnomalyDetector {
       }
 
       // 3. Low extraction confidence threshold
-      if (doc.extractedFields.extractionConfidence < 0.7) {
+      const extractionConfidence = doc.extractedFields.extractionConfidence;
+      if (typeof extractionConfidence === 'number' && extractionConfidence < 0.7) {
         reports.push({
           anomalyType: 'LOW_OCR_FIDELITY_INCONCLUSIVE',
           severity: 'LOW',
           affectedDocumentIds: [doc.id],
-          observedEvidence: `OCR text confidence is ${(doc.extractedFields.extractionConfidence * 100).toFixed(0)}%, indicating heavy compression, noise, or skew.`,
+          observedEvidence: `OCR text confidence is ${(extractionConfidence * 100).toFixed(0)}%, indicating heavy compression, noise, or skew.`,
           detectionMethod: 'OCR Confidence Matrix',
           reliabilityLimitation: 'Document degradation or scanning DPI under 150 can degrade OCR confidence without indicating tampering.',
           recommendedNextStep: 'Request institution provide higher resolution color scan (300 DPI) for clarity.',

@@ -14,7 +14,8 @@ Covers:
 """
 
 import unittest
-from datetime import datetime
+from types import SimpleNamespace
+from datetime import datetime, timezone
 from backend.main import (
     store,
     normalize_instrument_number,
@@ -27,6 +28,12 @@ from backend.main import (
     circuit_breaker
 )
 from backend.models.schemas import ApprovalRequestSchema
+
+
+def trusted_request(user_id):
+    user = next((candidate for candidate in store.users if candidate["id"] == user_id), None)
+    return SimpleNamespace(state=SimpleNamespace(user=user))
+
 
 class TestAicteRegulatoryValidation(unittest.TestCase):
     def setUp(self):
@@ -79,7 +86,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
             approvalReason="Attempting approval despite conflict"
         )
         with self.assertRaises(Exception) as ctx:
-            submit_approval("app-8", req, x_user_id="usr-reviewer-1")
+            submit_approval("app-8", req, request=trusted_request("usr-reviewer-1"))
         self.assertIn("DUPLICATE_CONFLICT_REVIEW", str(ctx.exception))
 
     # ==============================================================
@@ -103,7 +110,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
             idempotencyKey="idem-concurrent-1",
             approvalReason="Statutory approval granted by Officer 1"
         )
-        res1 = submit_approval("app-1", req1, x_user_id="usr-reviewer-1")
+        res1 = submit_approval("app-1", req1, request=trusted_request("usr-reviewer-1"))
 
         self.assertTrue(res1["success"])
         self.assertEqual(res1["application"]["version"], 2)
@@ -116,7 +123,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
             approvalReason="Officer 2 approving concurrently"
         )
         with self.assertRaises(Exception) as ctx:
-            submit_approval("app-1", req2, x_user_id="usr-admin-1")
+            submit_approval("app-1", req2, request=trusted_request("usr-admin-1"))
 
         err_msg = str(ctx.exception)
         self.assertIn("409", err_msg)
@@ -143,7 +150,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
         )
 
         with self.assertRaises(Exception) as ctx:
-            submit_approval("app-1", req, x_user_id="usr-reviewer-1")
+            submit_approval("app-1", req, request=trusted_request("usr-reviewer-1"))
 
         err_msg = str(ctx.exception)
         self.assertIn("500", err_msg)
@@ -177,7 +184,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
         )
 
         with self.assertRaises(Exception) as ctx:
-            submit_approval("app-1", req, x_user_id="usr-reviewer-2")
+            submit_approval("app-1", req, request=trusted_request("usr-reviewer-2"))
 
         err_msg = str(ctx.exception)
         self.assertIn("403", err_msg)
@@ -212,7 +219,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
             approvalReason="Attempting approval on tampered doc"
         )
         with self.assertRaises(Exception) as ctx:
-            submit_approval("app-3", req, x_user_id="usr-reviewer-1")
+            submit_approval("app-3", req, request=trusted_request("usr-reviewer-1"))
         self.assertIn("unresolved blocking findings", str(ctx.exception))
 
     # ==============================================================
@@ -223,6 +230,13 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
         Scenario 3: FDR expiring today sets status to EXPIRING_TODAY,
         creates an urgent escalation task, and blocks approval.
         """
+        today = datetime.now(timezone.utc).date().isoformat()
+        expiring_fdr = next(
+            d for d in store.documents
+            if d["applicationId"] == "app-5" and d["documentType"] == "FDR_OR_ENDOWMENT"
+        )
+        expiring_fdr["extractedFields"]["maturityDate"] = today
+
         run_application_validation("app-5")
         app_5 = store.applications["app-5"]
         self.assertEqual(app_5["status"], "EXPIRING_TODAY")
@@ -237,7 +251,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
             approvalReason="Approving expiring document"
         )
         with self.assertRaises(Exception) as ctx:
-            submit_approval("app-5", req, x_user_id="usr-reviewer-1")
+            submit_approval("app-5", req, request=trusted_request("usr-reviewer-1"))
         self.assertIn("Pledged financial instrument expires today", str(ctx.exception))
 
     # ==============================================================
@@ -267,7 +281,11 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
         Scenario 6: Simulated bank verification timeout triggers 3 bounded retries,
         transitions circuit breaker to OPEN, returns SOURCE_UNAVAILABLE, never marks VERIFIED.
         """
-        res = verify_document("doc-fdr-delhi", simulate_mode="TIMEOUT")
+        res = verify_document(
+            "doc-fdr-delhi",
+            request=trusted_request("usr-reviewer-1"),
+            simulate_mode="TIMEOUT",
+        )
         self.assertEqual(res["result"], "SOURCE_UNAVAILABLE")
         self.assertEqual(res["status"], "PENDING")
         self.assertEqual(res["retryCount"], 3)
@@ -303,7 +321,7 @@ class TestAicteRegulatoryValidation(unittest.TestCase):
             application_id="app-8",
             document_id="doc-fdr-bangalore",
             replacement_reason="Uploaded corrected bank endowment receipt with fresh IFSC stamp",
-            x_user_id="usr-reviewer-1"
+            request=trusted_request("usr-reviewer-1")
         )
 
         self.assertTrue(res["success"])

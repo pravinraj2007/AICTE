@@ -10,12 +10,15 @@ Implements:
 import os
 import re
 import uuid
+import asyncio
+import copy
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 try:
-    from fastapi import FastAPI, HTTPException, Header, Query, Body, status
+    from fastapi import FastAPI, HTTPException, Header, Query, Body, File, Request, UploadFile, status
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
@@ -28,6 +31,14 @@ except ImportError:
             return lambda f: f
         def add_middleware(self, *args, **kwargs):
             pass
+        def middleware(self, *args, **kwargs):
+            return lambda f: f
+    class Request:
+        pass
+    class UploadFile:
+        pass
+    class JSONResponse:
+        pass
     class HTTPException(Exception):
         def __init__(self, status_code: int, detail: Any):
             self.status_code = status_code
@@ -45,6 +56,8 @@ except ImportError:
         return default
     def Body(default=None, **kwargs):
         return default
+    def File(default=None, **kwargs):
+        return default
     class CORSMiddleware:
         pass
 
@@ -61,6 +74,9 @@ from backend.models.schemas import (
     AuditEventModel,
     ApprovalRequestSchema
 )
+from backend.document_extraction import DocumentExtractionError, _tesseract_available, extract_document
+from backend.auth import get_server_role_mapping, verify_oidc_token
+from backend.persistence import SQLiteStateStore, StateConflictError
 
 # Precise decimal calculation (integer cents) to prevent floating point drift
 def calculate_financial_shortfall(required: float, verified: float) -> float:
@@ -79,6 +95,27 @@ def normalize_instrument_number(num: Optional[str]) -> str:
 class Store:
     def __init__(self):
         self.reset()
+        self._persistence = SQLiteStateStore("fastapi")
+        stored_state = self._persistence.load()
+        if stored_state:
+            self.restore(stored_state)
+        else:
+            self.persist()
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key != "_persistence"
+        }
+
+    def restore(self, state: Dict[str, Any]) -> None:
+        for key, value in state.items():
+            if key != "_persistence":
+                setattr(self, key, value)
+
+    def persist(self, expected_application_versions: Optional[Dict[str, int]] = None) -> None:
+        self._persistence.save(self.snapshot(), expected_application_versions)
 
     def reset(self):
         self.users = [
@@ -410,6 +447,8 @@ class Store:
         self.escalation_tasks = []
         self.approval_commands = {}
         self.audit_events = []
+        self.reviewer_actions = []
+        self.verification_attempts = []
 
 store = Store()
 
@@ -419,13 +458,168 @@ app = FastAPI(
     version="1.0.0"
 )
 
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "AICTE_ALLOWED_ORIGINS",
+        "http://localhost:3000,http://localhost:3001",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_state_write_lock = asyncio.Lock()
+
+
+def _request_is_loopback(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    return host in {"127.0.0.1", "::1", "testclient"}
+
+
+def _is_production() -> bool:
+    return os.getenv("ENVIRONMENT", "development").lower() == "production"
+
+
+def _authorization_error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": {"code": code, "message": message}},
+    )
+
+
+def _application_access_denied(user: Dict[str, Any], application_id: str) -> bool:
+    app_record = store.applications.get(application_id)
+    return bool(
+        user.get("role") == "INSTITUTION"
+        and (not app_record or app_record.get("institutionId") != user.get("institutionId"))
+    )
+
+
+def _authorize_domain_request(request: Request, user: Dict[str, Any]) -> Optional[JSONResponse]:
+    path = request.url.path
+    role = user.get("role")
+    app_match = re.search(r"/applications/([^/]+)", path)
+    application_id = app_match.group(1) if app_match else None
+    document_match = re.search(r"/documents/([^/]+)", path)
+    if not application_id and document_match:
+        document = next((item for item in store.documents if item["id"] == document_match.group(1)), None)
+        application_id = document.get("applicationId") if document else None
+
+    if application_id and _application_access_denied(user, application_id):
+        return _authorization_error(404, "RESOURCE_NOT_FOUND", "Resource not found.")
+
+    if path == "/api/v1/applications" and request.method == "GET":
+        return None
+    if path.startswith("/api/v1/applications/") and path.endswith("/approval") and request.method == "POST":
+        if role in {"REVIEWER", "ADMIN"} and user.get("canApproveApplications") is True:
+            return None
+        return _authorization_error(403, "FORBIDDEN", "Statutory approval authority is required.")
+    if "/documents/" in path and path.endswith("/replace") and request.method == "POST":
+        if role == "INSTITUTION" and application_id:
+            return None
+        return _authorization_error(403, "FORBIDDEN", "Only the owning institution may replace this document.")
+    if path.startswith("/api/v1/documents/") and path.endswith("/verify") and request.method == "POST":
+        if role in {"REVIEWER", "ADMIN"}:
+            return None
+        return _authorization_error(403, "FORBIDDEN", "Reviewer permission is required.")
+    if path == "/api/v1/applications" or path.startswith("/api/v1/applications/"):
+        if request.method == "GET":
+            return None
+        if role in {"REVIEWER", "ADMIN"}:
+            return None
+        return _authorization_error(403, "FORBIDDEN", "Reviewer permission is required.")
+    if request.method in {"GET", "HEAD"} and role in {"INSTITUTION", "REVIEWER", "ADMIN"}:
+        return None
+    return _authorization_error(403, "FORBIDDEN", "This identity is not authorized for this action.")
+
+
+@app.middleware("http")
+async def authenticate_authorize_and_persist(request: Request, call_next):
+    if not request.url.path.startswith("/api/v1/"):
+        return await call_next(request)
+
+    if request.url.path == "/api/v1/documents/extract":
+        return await call_next(request)
+
+    user: Optional[Dict[str, Any]] = None
+    demo_enabled = (
+        not _is_production()
+        and os.getenv("AICTE_DEMO_ROLE_SWITCH_ENABLED", "").lower() == "true"
+        and _request_is_loopback(request)
+    )
+    if demo_enabled:
+        demo_user_id = request.headers.get("x-demo-user-id")
+        user = next((candidate for candidate in store.users if candidate["id"] == demo_user_id), None)
+
+    if user is None:
+        authorization = request.headers.get("authorization", "")
+        if not authorization.startswith("Bearer "):
+            if _is_production() and not (
+                os.getenv("OIDC_ISSUER") and os.getenv("OIDC_AUDIENCE") and os.getenv("OIDC_JWKS_URL")
+            ):
+                return _authorization_error(
+                    503,
+                    "AUTHENTICATION_NOT_CONFIGURED",
+                    "Trusted OIDC authentication is not configured.",
+                )
+            return _authorization_error(401, "TOKEN_REQUIRED", "A valid bearer token is required.")
+        try:
+            claims = await verify_oidc_token(authorization[len("Bearer "):])
+            mapped = get_server_role_mapping(claims.get("sub", ""))
+            if mapped is None:
+                return _authorization_error(403, "OIDC_IDENTITY_UNMAPPED", "This identity has no assigned role.")
+            user = mapped
+        except RuntimeError as exc:
+            code = str(exc)
+            status_code = 503
+            message = "Trusted OIDC authentication is unavailable."
+            return _authorization_error(status_code, code, message)
+        except ValueError:
+            return _authorization_error(401, "INVALID_TOKEN", "The bearer token is invalid or expired.")
+        except Exception:
+            return _authorization_error(503, "OIDC_PROVIDER_UNAVAILABLE", "Trusted OIDC authentication is unavailable.")
+
+    request.state.user = user
+    denial = _authorize_domain_request(request, user)
+    if denial is not None:
+        return denial
+
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return await call_next(request)
+
+    async with _state_write_lock:
+        before = copy.deepcopy(store.snapshot())
+        response = await call_next(request)
+        try:
+            expected_versions = {}
+            before_applications = before.get("applications", {})
+            for application_id, previous_application in before_applications.items():
+                current_application = store.applications.get(application_id)
+                if current_application is not None and current_application != previous_application:
+                    expected_versions[application_id] = previous_application.get("version", 1)
+            store.persist(expected_versions)
+        except StateConflictError:
+            store.restore(before)
+            return _authorization_error(
+                409,
+                "APPLICATION_CONCURRENCY_CONFLICT",
+                "The application was concurrently updated; refresh before retrying.",
+            )
+        except Exception:
+            store.restore(before)
+            return _authorization_error(
+                503,
+                "PERSISTENCE_FAILED",
+                "The operation was not committed because durable storage failed.",
+            )
+        return response
 
 # Helper to log audit events
 def log_audit_event(actor_id: str, actor_name: str, actor_role: str, action: str, target_entity: str, target_id: str, details: Dict[str, Any], correlation_id: str):
@@ -472,7 +666,7 @@ def run_application_validation(application_id: str) -> Dict[str, Any]:
 
     findings = []
     run_id = f"run-{uuid.uuid4().hex[:8]}"
-    today_str = "2026-10-21"
+    today_str = datetime.now(timezone.utc).date().isoformat()
 
     app_docs = [d for d in store.documents if d["applicationId"] == application_id]
 
@@ -646,8 +840,8 @@ def run_application_validation(application_id: str) -> Dict[str, Any]:
 def submit_approval(
     application_id: str,
     payload: ApprovalRequestSchema,
+    request: Request,
     x_correlation_id: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header("usr-reviewer-1"),
     x_simulate_db_failure: Optional[str] = Header(None)
 ):
     correlation_id = x_correlation_id or f"corr-{uuid.uuid4().hex[:6]}"
@@ -655,7 +849,7 @@ def submit_approval(
     if not app_record:
         raise HTTPException(status_code=404, detail="Application not found")
 
-    officer = next((u for u in store.users if u["id"] == x_user_id), store.users[0])
+    officer = request.state.user
 
     # Idempotency check: if this idempotency key was already committed, return committed result
     if payload.idempotencyKey in store.approval_commands:
@@ -798,6 +992,18 @@ def submit_approval(
         },
         correlation_id
     )
+    store.reviewer_actions.append({
+        "id": f"act-{uuid.uuid4().hex[:8]}",
+        "applicationId": application_id,
+        "reviewerId": officer["id"],
+        "reviewerName": officer["name"],
+        "actionType": "APPROVAL_GRANTED",
+        "previousState": previous_state,
+        "newState": "REVIEW_COMPLETED",
+        "reason": payload.approvalReason,
+        "timestamp": app_record["approvedAt"],
+        "applicationVersion": app_record["version"],
+    })
 
     return {
         "success": True,
@@ -814,8 +1020,8 @@ def submit_approval(
 def replace_document(
     application_id: str,
     document_id: str,
+    request: Request,
     replacement_reason: str = Body(..., embed=True),
-    x_user_id: Optional[str] = Header("usr-reviewer-1")
 ):
     doc = next((d for d in store.documents if d["id"] == document_id and d["applicationId"] == application_id), None)
     if not doc:
@@ -850,7 +1056,7 @@ def replace_document(
     # 2. Update active document to new version
     doc["version"] = old_version_num + 1
     doc["uploadedAt"] = datetime.now(timezone.utc).isoformat()
-    doc["uploadedBy"] = x_user_id
+    doc["uploadedBy"] = request.state.user["id"]
 
     # 3. Mark all existing findings for this document as REASSESSMENT_REQUIRED
     for finding in store.validation_findings:
@@ -861,6 +1067,29 @@ def replace_document(
     # 4. Increment application OCC version
     app_record["version"] = app_record.get("version", 1) + 1
     app_record["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    actor = request.state.user
+    store.reviewer_actions.append({
+        "id": f"act-{uuid.uuid4().hex[:8]}",
+        "applicationId": application_id,
+        "reviewerId": actor["id"],
+        "reviewerName": actor["name"],
+        "actionType": "DOCUMENT_REPLACED",
+        "previousState": None,
+        "newState": None,
+        "reason": replacement_reason,
+        "timestamp": app_record["updatedAt"],
+        "applicationVersion": app_record["version"],
+    })
+    log_audit_event(
+        actor["id"],
+        actor["name"],
+        actor["role"],
+        "DOCUMENT_REPLACED",
+        "DOCUMENT",
+        document_id,
+        {"applicationId": application_id, "version": doc["version"]},
+        f"corr-{uuid.uuid4().hex[:6]}",
+    )
 
     return {
         "success": True,
@@ -889,9 +1118,36 @@ class CircuitBreaker:
 
 circuit_breaker = CircuitBreaker()
 
+@app.post("/api/v1/documents/extract")
+async def extract_uploaded_document(
+    request: Request,
+    file: UploadFile = File(...)
+):
+    configured_token = os.getenv("DOCUMENT_PROCESSOR_TOKEN")
+    supplied_token = request.headers.get("x-document-processor-token", "")
+    environment = os.getenv("ENVIRONMENT", "development").lower()
+    remote_host = request.client.host if request.client else ""
+
+    if configured_token:
+        import hmac
+        if not hmac.compare_digest(configured_token, supplied_token):
+            raise HTTPException(status_code=403, detail={"code": "INVALID_SERVICE_CREDENTIAL"})
+    elif environment != "development" or remote_host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(status_code=503, detail={"code": "PROCESSOR_AUTH_NOT_CONFIGURED"})
+
+    content = await file.read(25 * 1024 * 1024 + 1)
+    if len(content) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail={"code": "FILE_TOO_LARGE"})
+
+    try:
+        return extract_document(content, file.filename or "document", file.content_type or "")
+    except DocumentExtractionError as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)}) from exc
+
 @app.post("/api/v1/documents/{document_id}/verify")
 def verify_document(
     document_id: str,
+    request: Request,
     simulate_mode: Optional[str] = Query(None, description="TIMEOUT or SUCCESS")
 ):
     doc = next((d for d in store.documents if d["id"] == document_id), None)
@@ -900,7 +1156,7 @@ def verify_document(
 
     if simulate_mode == "TIMEOUT" or circuit_breaker.state == "OPEN":
         circuit_breaker.record_failure()
-        return {
+        result = {
             "result": "SOURCE_UNAVAILABLE",
             "status": "PENDING",
             "isSimulated": True,
@@ -910,16 +1166,39 @@ def verify_document(
             "circuitBreakerState": circuit_breaker.state,
             "observations": "Bank Direct Verification API timed out after 3 retries (10,000ms bounded backoff). Verification remains PENDING. Auto-approval not permitted."
         }
-
-    circuit_breaker.record_success()
-    return {
-        "result": "VERIFIED_IN_SIMULATION",
-        "status": "VERIFIED",
+    else:
+        circuit_breaker.record_success()
+        result = {
+            "result": "VERIFIED_IN_SIMULATION",
+            "status": "VERIFIED",
+            "isSimulated": True,
+            "simulationDisclaimer": "SIMULATED — NOT OFFICIAL VERIFICATION",
+            "circuitBreakerState": circuit_breaker.state,
+            "observations": "FDR confirmed active in bank core banking simulated records."
+        }
+    actor = request.state.user
+    attempt = {
+        "id": f"verif-{uuid.uuid4().hex[:8]}",
+        "applicationId": doc["applicationId"],
+        "documentId": document_id,
+        "actorId": actor["id"],
+        "status": result["status"],
+        "result": result["result"],
         "isSimulated": True,
-        "simulationDisclaimer": "SIMULATED — NOT OFFICIAL VERIFICATION",
-        "circuitBreakerState": circuit_breaker.state,
-        "observations": "FDR confirmed active in bank core banking simulated records."
+        "createdAt": datetime.now(timezone.utc).isoformat(),
     }
+    store.verification_attempts.append(attempt)
+    log_audit_event(
+        actor["id"],
+        actor["name"],
+        actor["role"],
+        "DOCUMENT_VERIFICATION_SIMULATED",
+        "DOCUMENT",
+        document_id,
+        {"result": result["result"], "isSimulated": True},
+        f"corr-{uuid.uuid4().hex[:6]}",
+    )
+    return result
 
 @app.get("/health")
 def health_check():
@@ -929,9 +1208,36 @@ def health_check():
         "environment": os.getenv("ENVIRONMENT", "development")
     }
 
+@app.get("/ready")
+def readiness_check():
+    production = os.getenv("ENVIRONMENT", "development").lower() != "development"
+    oidc_configured = bool(
+        os.getenv("OIDC_ISSUER")
+        and os.getenv("OIDC_AUDIENCE")
+        and os.getenv("OIDC_JWKS_URL")
+        and os.getenv("OIDC_SUBJECT_USER_MAP")
+        and os.getenv("OIDC_SUBJECT_USER_MAP") != "{}"
+    )
+    ready = not production or oidc_configured
+    return {
+        "ready": ready,
+        "checks": {
+            "authenticationConfigured": oidc_configured,
+            "documentExtractionConfigured": True,
+            "ocrEngineAvailable": _tesseract_available(),
+            "geminiIntegrationConfigured": False,
+        },
+    }
+
 @app.get("/api/v1/applications")
-def get_applications():
-    return {"applications": list(store.applications.values()), "total": len(store.applications)}
+def get_applications(request: Request):
+    user = request.state.user
+    applications = list(store.applications.values())
+    if user.get("role") == "INSTITUTION":
+        applications = [
+            item for item in applications if item.get("institutionId") == user.get("institutionId")
+        ]
+    return {"applications": applications, "total": len(applications)}
 
 @app.get("/api/v1/applications/{application_id}")
 def get_application(application_id: str):

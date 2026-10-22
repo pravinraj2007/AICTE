@@ -4,17 +4,29 @@
  * Versioned Document Replacements, and Adversarial Anomaly Protections.
  */
 
+import './server/loadEnv.ts';
 import express, { Request, Response, NextFunction } from 'express';
+import { AsyncLocalStorage } from 'async_hooks';
 import { createServer as createViteServer } from 'vite';
 import multer from 'multer';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
-import { db } from './server/db.ts';
+import { fileURLToPath } from 'url';
+import { db, PersistenceConflictError } from './server/db.ts';
 import { ruleEngine, normalizeInstrumentNumber } from './server/ruleEngine.ts';
 import { anomalyDetector } from './server/anomalyDetector.ts';
 import { verificationAdapters } from './server/verificationAdapters.ts';
-import { geminiService } from './server/geminiService.ts';
+import { analyzeExtractedDocument, geminiService } from './server/geminiService.ts';
+import {
+  AuthenticationError,
+  getDemoUser,
+  getOidcUser,
+  hasOidcConfiguration,
+  isDemoAuthEnabled,
+  isProductionEnvironment,
+  setDemoSession,
+} from './server/auth.ts';
 import {
   ApplicationStatus,
   DocumentType,
@@ -23,17 +35,39 @@ import {
   VerificationSource,
   ApprovalCommandRecord,
   DocumentVersionRecord,
+  DocumentRecord,
+  ExtractedFields,
   FdrInstrument,
+  GeminiDocumentAnalysis,
 } from './src/types/index.ts';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const isProduction = isProductionEnvironment;
+const userContext = new AsyncLocalStorage<User>();
+let writeQueue = Promise.resolve();
+const currentUser = new Proxy({} as User, {
+  get: (_target, property: keyof User) => userContext.getStore()?.[property],
+});
+
+async function acquireWriteLock(): Promise<() => void> {
+  const previous = writeQueue;
+  let release!: () => void;
+  writeQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  return release;
+}
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // Ensure private upload directory exists
-const uploadDir = path.resolve(process.cwd(), 'uploads/private');
+const uploadDir = path.resolve(
+  process.env.DOCUMENT_STORAGE_PATH ||
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'documents')
+);
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
@@ -54,8 +88,14 @@ const upload = multer({
   storage,
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB limit
   fileFilter: (_req, file, cb) => {
-    const allowed = ['application/pdf', 'image/png', 'image/jpeg'];
-    if (allowed.includes(file.mimetype)) {
+    const allowedTypes: Record<string, string> = {
+      '.pdf': 'application/pdf',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+    };
+    const extension = path.extname(file.originalname).toLowerCase();
+    if (allowedTypes[extension] === file.mimetype) {
       cb(null, true);
     } else {
       cb(new Error('Disallowed file format. Only PDF, PNG, and JPEG files are supported.'));
@@ -63,8 +103,116 @@ const upload = multer({
   },
 });
 
-// Current active session (default: Dr. Rajesh Sharma, can switch to Reviewer Dr. Sunil K. Mehta or Admin)
-let currentUser: User = db.users[0];
+interface DocumentExtractionResult {
+  processingStatus: 'PROCESSED' | 'FAILED' | 'MANUAL_REVIEW_REQUIRED';
+  pageCount: number;
+  extractionMethod: 'NONE' | 'PDF_TEXT_EXTRACTION' | 'TESSERACT_OCR' | 'HYBRID_EXTRACTION';
+  rawTextPreview?: string | null;
+  fields: {
+    institutionName?: string;
+    registrationNumber?: string;
+    issueDate?: string;
+    expiryDate?: string;
+    bankName?: string;
+    fdrNumber?: string;
+    holderName?: string;
+    financialAmount?: number;
+    currency?: string;
+  };
+  extractionConfidence?: number | null;
+  rawText: string;
+  fieldEvidence: Record<string, Array<{ page: number; text: string }>>;
+  pages: Array<{ page: number; text: string; method: string; status: string }>;
+}
+
+class DocumentProcessorError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number,
+    public errorCode: string
+  ) {
+    super(message);
+    this.name = 'DocumentProcessorError';
+  }
+}
+
+type UploadedDocumentFile = Pick<Express.Multer.File, 'path' | 'originalname' | 'mimetype'>;
+
+async function extractUploadedDocument(file: UploadedDocumentFile): Promise<DocumentExtractionResult> {
+  const form = new FormData();
+  const fileBytes = fs.readFileSync(file.path);
+  form.append(
+    'file',
+    new Blob([new Uint8Array(fileBytes)], { type: file.mimetype }),
+    path.basename(file.originalname)
+  );
+
+  const headers: Record<string, string> = {};
+  if (process.env.DOCUMENT_PROCESSOR_TOKEN) {
+    headers['x-document-processor-token'] = process.env.DOCUMENT_PROCESSOR_TOKEN;
+  }
+
+  let response: globalThis.Response;
+  try {
+    response = await fetch(
+      `${process.env.DOCUMENT_PROCESSOR_URL || 'http://127.0.0.1:8000'}/api/v1/documents/extract`,
+      {
+        method: 'POST',
+        headers,
+        body: form,
+        signal: AbortSignal.timeout(30_000),
+      }
+    );
+  } catch {
+    throw new DocumentProcessorError(
+      'Document processor is unavailable. Start the FastAPI service and retry.',
+      503,
+      'DOCUMENT_PROCESSOR_UNAVAILABLE'
+    );
+  }
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = payload?.detail;
+    throw new DocumentProcessorError(
+      typeof detail?.message === 'string' ? detail.message : 'Document processing failed.',
+      response.status,
+      typeof detail?.code === 'string' ? detail.code : 'DOCUMENT_PROCESSING_FAILED'
+    );
+  }
+
+  return payload as DocumentExtractionResult;
+}
+
+const validateUploadSignature = (req: Request, res: Response, next: NextFunction) => {
+  if (!req.file) {
+    next();
+    return;
+  }
+
+  const header = Buffer.alloc(8);
+  const fileDescriptor = fs.openSync(req.file.path, 'r');
+  let bytesRead: number;
+  try {
+    bytesRead = fs.readSync(fileDescriptor, header, 0, header.length, 0);
+  } finally {
+    fs.closeSync(fileDescriptor);
+  }
+
+  const signature = header.subarray(0, bytesRead);
+  const valid =
+    (req.file.mimetype === 'application/pdf' && signature.subarray(0, 5).toString() === '%PDF-') ||
+    (req.file.mimetype === 'image/png' && signature.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) ||
+    (req.file.mimetype === 'image/jpeg' && signature.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff])));
+
+  if (!valid) {
+    fs.unlinkSync(req.file.path);
+    res.status(400).json({ error: 'File contents do not match the supported document type.' });
+    return;
+  }
+
+  next();
+};
 
 // Request logger with correlation ID
 app.use((req, res, next) => {
@@ -77,45 +225,290 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({ status: 'healthy' });
+});
+
+app.get('/ready', async (_req: Request, res: Response) => {
+  const geminiConfigured = geminiService.isAvailable();
+  const production = isProduction();
+  const oidcConfigured =
+    hasOidcConfiguration() &&
+    Boolean(process.env.OIDC_SUBJECT_USER_MAP && process.env.OIDC_SUBJECT_USER_MAP !== '{}');
+  const processorUrl = process.env.DOCUMENT_PROCESSOR_URL || 'http://127.0.0.1:8000';
+  let processorReachable = false;
+  try {
+    const processorHealth = await fetch(`${processorUrl}/health`, { signal: AbortSignal.timeout(1500) });
+    processorReachable = processorHealth.ok;
+  } catch {
+    processorReachable = false;
+  }
+  const ready = processorReachable && (!production || oidcConfigured);
+  res.status(ready ? 200 : 503).json({
+    ready,
+    checks: {
+      authentication: {
+        configured: oidcConfigured,
+        mode: oidcConfigured ? 'oidc' : isDemoAuthEnabled(_req) ? 'local_demo_opt_in' : 'unavailable',
+      },
+      documentProcessor: { configured: true, reachable: processorReachable },
+      gemini: {
+        configured: geminiConfigured,
+        providerEnabled: geminiConfigured,
+        errorCode: geminiConfigured ? null : 'GEMINI_NOT_CONFIGURED',
+        integration: 'document_upload_analysis',
+        providerAvailability: 'not_checked',
+      },
+    },
+  });
+});
+
+function userCanAccessApplication(user: User, applicationId: string): boolean {
+  if (user.role !== 'INSTITUTION') return true;
+  const application = db.applications.find((candidate) => candidate.id === applicationId);
+  return Boolean(application && application.institutionId === user.institutionId);
+}
+
+function authorizeApiRequest(req: Request, user: User): { status: number; code: string; error: string } | undefined {
+  const route = req.originalUrl.split('?')[0];
+  const appMatch = route.match(/\/applications\/([^/]+)/);
+  const documentMatch = route.match(/\/documents\/([^/]+)/);
+  const findingMatch = route.match(/\/findings\/([^/]+)/);
+  let applicationId = appMatch?.[1];
+
+  if (!applicationId && documentMatch) {
+    applicationId = db.documents.find((document) => document.id === documentMatch[1])?.applicationId;
+  }
+  if (!applicationId && findingMatch) {
+    applicationId = db.validationFindings.find((finding) => finding.id === findingMatch[1])?.applicationId;
+  }
+
+  if (applicationId && !userCanAccessApplication(user, applicationId)) {
+    return { status: 404, code: 'RESOURCE_NOT_FOUND', error: 'Resource not found.' };
+  }
+
+  const isReviewer = user.role === 'REVIEWER' || user.role === 'ADMIN';
+  const isAdmin = user.role === 'ADMIN';
+  const isInstitutionOwner = user.role === 'INSTITUTION' && Boolean(applicationId);
+  const roleDenied = (): { status: number; code: string; error: string } => ({
+    status: 403,
+    code: 'FORBIDDEN',
+    error: 'This identity is not authorized to perform this action.',
+  });
+
+  if (route.startsWith('/api/v1/admin/')) return isAdmin ? undefined : roleDenied();
+  if (route === '/api/v1/dashboard/metrics') return isReviewer ? undefined : roleDenied();
+  if (route === '/api/v1/auth/users') return isAdmin || isDemoAuthEnabled(req) ? undefined : roleDenied();
+
+  if (route === '/api/v1/institutions' && user.role === 'INSTITUTION' && !user.institutionId) {
+    return roleDenied();
+  }
+
+  if (req.method === 'POST' && route === '/api/v1/applications') {
+    return user.role === 'INSTITUTION' && user.institutionId ? undefined : roleDenied();
+  }
+
+  if (req.method === 'POST' && /\/applications\/[^/]+\/(submit|documents)$/.test(route)) {
+    return isInstitutionOwner ? undefined : roleDenied();
+  }
+
+  if (req.method === 'POST' && /\/applications\/[^/]+\/documents\/[^/]+\/replace$/.test(route)) {
+    return isInstitutionOwner ? undefined : roleDenied();
+  }
+
+  if (req.method === 'DELETE' && route.startsWith('/api/v1/documents/')) {
+    return isInstitutionOwner || isAdmin ? undefined : roleDenied();
+  }
+
+  if (req.method === 'POST' && route.endsWith('/approval')) {
+    return isReviewer && user.canApproveApplications === true ? undefined : roleDenied();
+  }
+
+  if (
+    (req.method === 'PATCH' && route.startsWith('/api/v1/findings/')) ||
+    (req.method === 'POST' &&
+      (route.endsWith('/resolve-rule') ||
+        route.endsWith('/validate') ||
+        route.endsWith('/reassess') ||
+        route.endsWith('/verify-document') ||
+        /\/documents\/[^/]+\/verify$/.test(route) ||
+        /\/documents\/[^/]+\/gemini-analysis\/retry$/.test(route))) ||
+    (req.method === 'PATCH' && route.startsWith('/api/v1/admin/escalations/'))
+  ) {
+    return isReviewer || (user.role === 'INSTITUTION' && route.includes('/gemini-analysis/retry') && isInstitutionOwner)
+      ? undefined
+      : roleDenied();
+  }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD' && !isReviewer) return roleDenied();
+  return undefined;
+}
+
+app.use('/api/v1', async (req: Request, res: Response, next: NextFunction) => {
+  const route = req.originalUrl.split('?')[0];
+  if (route === '/api/v1/auth/login' || route === '/api/v1/auth/switch-user') {
+    next();
+    return;
+  }
+
+  if (route === '/api/v1/auth/me' && isDemoAuthEnabled(req) && !req.headers.authorization && !getDemoUser(req, db.users)) {
+    res.json({
+      user: null,
+      availableRoles: ['INSTITUTION', 'REVIEWER', 'ADMIN'],
+      demoRoleSwitchEnabled: true,
+    });
+    return;
+  }
+
+  if (route === '/api/v1/auth/users' && isDemoAuthEnabled(req) && !req.headers.authorization) {
+    next();
+    return;
+  }
+
+  try {
+    const demoUser = getDemoUser(req, db.users);
+    const authorization = req.headers.authorization;
+    let user: User;
+    if (demoUser) {
+      user = demoUser;
+    } else if (authorization?.startsWith('Bearer ')) {
+      user = await getOidcUser(authorization.slice('Bearer '.length));
+    } else if (isDemoAuthEnabled(req)) {
+      throw new AuthenticationError(
+        'Select a demo identity using the local development role switcher.',
+        401,
+        'DEMO_SESSION_REQUIRED'
+      );
+    } else if (!hasOidcConfiguration()) {
+      throw new AuthenticationError(
+        'Trusted OIDC authentication is not configured.',
+        503,
+        'OIDC_NOT_CONFIGURED'
+      );
+    } else {
+      throw new AuthenticationError('A valid bearer token is required.', 401, 'TOKEN_REQUIRED');
+    }
+
+    const denial = authorizeApiRequest(req, user);
+    if (denial) {
+      res.status(denial.status).json({ error: denial.error, code: denial.code });
+      return;
+    }
+
+    const writeState = req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS';
+    const reportExport = req.method === 'GET' && route.endsWith('/report');
+    const releaseWrite = writeState || reportExport ? await acquireWriteLock() : undefined;
+    let lockReleased = false;
+    const releaseLock = () => {
+      if (!lockReleased && releaseWrite) {
+        lockReleased = true;
+        releaseWrite();
+      }
+    };
+    if (releaseWrite) {
+      res.once('finish', releaseLock);
+      res.once('close', releaseLock);
+    }
+    const before = writeState || reportExport ? db.snapshot() : undefined;
+    const originalJson = res.json.bind(res);
+    let persisted = false;
+    res.json = ((body: unknown) => {
+      if (before && !persisted) {
+        persisted = true;
+        try {
+          const expectedVersions: Record<string, number> = {};
+          for (const previousApplication of before.applications) {
+            const currentApplication = db.applications.find(
+              (application) => application.id === previousApplication.id
+            );
+            if (
+              currentApplication &&
+              JSON.stringify(previousApplication) !== JSON.stringify(currentApplication)
+            ) {
+              expectedVersions[previousApplication.id] = previousApplication.version;
+            }
+          }
+          db.persist(expectedVersions);
+        } catch (error) {
+          db.restore(before);
+          if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+          if (error instanceof PersistenceConflictError) {
+            res.statusCode = 409;
+            return originalJson({
+              error: 'The application was concurrently updated; refresh before retrying.',
+              code: 'APPLICATION_CONCURRENCY_CONFLICT',
+            });
+          }
+          res.statusCode = 500;
+          return originalJson({
+            error: 'The operation was not committed because durable storage failed.',
+            code: 'PERSISTENCE_FAILED',
+          });
+        }
+      }
+      return originalJson(body);
+    }) as Response['json'];
+
+    userContext.run(user, () => next());
+  } catch (error) {
+    if (error instanceof AuthenticationError) {
+      res.status(error.statusCode).json({ error: error.message, code: error.code });
+      return;
+    }
+    res.status(503).json({ error: 'Authentication could not be verified.', code: 'AUTHENTICATION_UNAVAILABLE' });
+  }
+});
+
 // ==========================================
 // 1. AUTH & USER ENDPOINTS
 // ==========================================
 
 app.get('/api/v1/auth/me', (_req: Request, res: Response) => {
   res.json({
-    user: currentUser,
-    availableRoles: ['INSTITUTION', 'REVIEWER', 'ADMIN'],
+    user: userContext.getStore(),
+    availableRoles: isDemoAuthEnabled(_req) ? ['INSTITUTION', 'REVIEWER', 'ADMIN'] : [],
+    demoRoleSwitchEnabled: isDemoAuthEnabled(_req),
   });
 });
 
 app.post('/api/v1/auth/login', (req: Request, res: Response) => {
-  const { email } = req.body;
-  const user = db.users.find((u) => u.email.toLowerCase() === (email || '').toLowerCase());
-  if (user) {
-    currentUser = user;
-    db.logAuditEvent(user, 'USER_LOGIN', 'USER', user.id, { email });
-    res.json({ success: true, user: currentUser });
-  } else {
-    res.status(401).json({ error: 'Invalid user credentials for demonstration' });
-  }
+  res.status(410).json({
+    error: 'Email-only login has been disabled. Use a trusted OIDC bearer token.',
+    code: 'PASSWORD_AUTH_NOT_CONFIGURED',
+  });
 });
 
 app.post('/api/v1/auth/switch-user', (req: Request, res: Response) => {
   const { userId } = req.body;
+  if (!isDemoAuthEnabled(req)) {
+    res.status(403).json({ error: 'Demo role switching is disabled.', code: 'DEMO_AUTH_DISABLED' });
+    return;
+  }
   const user = db.users.find((u) => u.id === userId);
-  if (user) {
-    currentUser = user;
-    db.logAuditEvent(user, 'ROLE_SWITCHED', 'USER', user.id, {
+  if (!user) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  const before = db.snapshot();
+  try {
+    res.setHeader('Set-Cookie', setDemoSession(req, user.id));
+    db.logAuditEvent(user, 'DEMO_ROLE_SWITCHED', 'USER', user.id, {
       newRole: user.role,
       canApprove: user.canApproveApplications,
     });
-    res.json({ success: true, user: currentUser });
-  } else {
-    res.status(404).json({ error: 'User not found' });
+    db.persist();
+    res.json({ success: true, user });
+  } catch {
+    db.restore(before);
+    res.status(500).json({ error: 'Demo session could not be persisted.', code: 'PERSISTENCE_FAILED' });
   }
 });
 
-app.get('/api/v1/auth/users', (_req: Request, res: Response) => {
+app.get('/api/v1/auth/users', (req: Request, res: Response) => {
+  if (!isDemoAuthEnabled(req) && currentUser.role !== 'ADMIN') {
+    res.status(403).json({ error: 'Administrator permission is required.', code: 'FORBIDDEN' });
+    return;
+  }
   res.json({ users: db.users });
 });
 
@@ -124,10 +517,18 @@ app.get('/api/v1/auth/users', (_req: Request, res: Response) => {
 // ==========================================
 
 app.get('/api/v1/institutions', (_req: Request, res: Response) => {
-  res.json({ institutions: db.institutions });
+  const institutions =
+    currentUser.role === 'INSTITUTION'
+      ? db.institutions.filter((institution) => institution.id === currentUser.institutionId)
+      : db.institutions;
+  res.json({ institutions });
 });
 
 app.get('/api/v1/institutions/:id', (req: Request, res: Response) => {
+  if (currentUser.role === 'INSTITUTION' && req.params.id !== currentUser.institutionId) {
+    res.status(404).json({ error: 'Institution not found' });
+    return;
+  }
   const inst = db.institutions.find((i) => i.id === req.params.id);
   if (!inst) {
     res.status(404).json({ error: 'Institution not found' });
@@ -145,7 +546,7 @@ app.get('/api/v1/applications', (req: Request, res: Response) => {
 
   let list = [...db.applications];
 
-  if (currentUser.role === 'INSTITUTION' && currentUser.institutionId) {
+  if (currentUser.role === 'INSTITUTION') {
     list = list.filter((a) => a.institutionId === currentUser.institutionId);
   }
 
@@ -206,11 +607,11 @@ app.get('/api/v1/applications/:id', (req: Request, res: Response) => {
 app.post('/api/v1/applications', (req: Request, res: Response) => {
   const { category, proposedIntake, proposedProgramme, notes, academicYear } = req.body;
 
-  let instId = currentUser.institutionId || 'inst-1';
-  let inst = db.institutions.find((i) => i.id === instId);
+  const instId = currentUser.institutionId;
+  const inst = db.institutions.find((i) => i.id === instId);
   if (!inst) {
-    inst = db.institutions[0];
-    instId = inst.id;
+    res.status(403).json({ error: 'The authenticated institution has no configured institution record.' });
+    return;
   }
 
   const appNumber = `AICTE/2026-27/APP-${8500 + db.applications.length + 1}`;
@@ -220,7 +621,7 @@ app.post('/api/v1/applications', (req: Request, res: Response) => {
     id: `app-${Date.now()}`,
     version: 1, // Start with version 1
     applicationNumber: appNumber,
-    institutionId: instId,
+    institutionId: inst.id,
     institutionName: inst.name,
     category: category || 'Extension of Approval',
     academicYear: academicYear || '2026-2027',
@@ -332,7 +733,11 @@ app.post('/api/v1/applications/:id/approval', (req: Request, res: Response) => {
   }
 
   // 2. SCENARIO 8: Optimistic Concurrency Control (OCC) Check
-  if (expectedVersion !== undefined && appRecord.version !== expectedVersion) {
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+    res.status(400).json({ error: 'A valid expected application version is required.', correlationId });
+    return;
+  }
+  if (appRecord.version !== expectedVersion) {
     res.status(409).json({
       error: `HTTP 409 Conflict: Application state has been updated concurrently by another officer. Expected version ${expectedVersion}, but current database version is ${appRecord.version}. Please refresh and inspect recent scrutiny notes.`,
       currentVersion: appRecord.version,
@@ -343,6 +748,14 @@ app.post('/api/v1/applications/:id/approval', (req: Request, res: Response) => {
   }
 
   // 3. Status and Prerequisites Check
+  if (!db.validationRuns.some((run) => run.applicationId === appRecord.id)) {
+    res.status(400).json({
+      error: 'Cannot approve: Application must complete deterministic validation before approval.',
+      correlationId,
+    });
+    return;
+  }
+
   if (appRecord.status === 'DUPLICATE_CONFLICT_REVIEW') {
     res.status(400).json({
       error: 'Cannot approve: Application is held under DUPLICATE_CONFLICT_REVIEW. Instrument conflict must be resolved first.',
@@ -382,7 +795,7 @@ app.post('/api/v1/applications/:id/approval', (req: Request, res: Response) => {
       id: `cmd-${Date.now()}`,
       idempotencyKey: idempotencyKey || `idem-${Date.now()}`,
       applicationId: appRecord.id,
-      expectedVersion: appRecord.version,
+      expectedVersion,
       officerId: currentUser.id,
       officerName: currentUser.name,
       officerRole: currentUser.role,
@@ -419,7 +832,7 @@ app.post('/api/v1/applications/:id/approval', (req: Request, res: Response) => {
     id: `cmd-${Date.now()}`,
     idempotencyKey: idempotencyKey || `idem-${Date.now()}`,
     applicationId: appRecord.id,
-    expectedVersion: appRecord.version,
+    expectedVersion,
     officerId: currentUser.id,
     officerName: currentUser.name,
     officerRole: currentUser.role,
@@ -508,6 +921,7 @@ app.post('/api/v1/applications/:id/resolve-rule', (req: Request, res: Response) 
 app.post(
   '/api/v1/applications/:id/documents/:docId/replace',
   upload.single('file'),
+  validateUploadSignature,
   async (req: Request, res: Response) => {
     try {
       const appRecord = db.applications.find((a) => a.id === req.params.id);
@@ -529,7 +943,32 @@ app.post(
 
       const fileBuffer = fs.readFileSync(req.file.path);
       const newSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+      let extraction: DocumentExtractionResult;
+      try {
+        extraction = await extractUploadedDocument(req.file);
+      } catch (error) {
+        fs.unlinkSync(req.file.path);
+        if (error instanceof DocumentProcessorError) {
+          res.status(error.statusCode).json({ error: error.message, code: error.errorCode });
+          return;
+        }
+        throw error;
+      }
+      const geminiAnalysis = await analyzeExtractedDocument(
+        extraction,
+        existingDoc.documentType,
+        req.file.mimetype
+      );
       const replacementReason = req.body.replacementReason || 'Corrected document uploaded by institution';
+      const extractedFields: ExtractedFields = {
+        ...extraction.fields,
+        ...(extraction.fields.expiryDate ? { maturityDate: extraction.fields.expiryDate } : {}),
+        rawTextPreview: extraction.rawTextPreview || undefined,
+        extractionMethod: extraction.extractionMethod,
+        ...(typeof extraction.extractionConfidence === 'number'
+          ? { extractionConfidence: extraction.extractionConfidence }
+          : {}),
+      };
 
       // 1. Mark existing version record as inactive
       const oldVersionNumber = existingDoc.version;
@@ -550,18 +989,13 @@ app.post(
       existingDoc.storageKey = req.file.path;
       existingDoc.uploadedAt = new Date().toISOString();
       existingDoc.uploadedBy = currentUser.id;
-
-      // Extract new fields or update amount if provided in body
-      if (req.body.financialAmount) {
-        existingDoc.extractedFields.financialAmount = parseFloat(req.body.financialAmount);
-      }
-      if (req.body.fdrNumber) {
-        existingDoc.extractedFields.fdrNumber = req.body.fdrNumber;
-      }
-      if (req.body.expiryDate) {
-        existingDoc.extractedFields.expiryDate = req.body.expiryDate;
-        existingDoc.extractedFields.maturityDate = req.body.expiryDate;
-      }
+      existingDoc.extractedFields = extractedFields;
+      existingDoc.processingStatus = extraction.processingStatus;
+      existingDoc.geminiAnalysis = geminiAnalysis;
+      existingDoc.pageCount = extraction.pageCount;
+      existingDoc.fieldEvidence = extraction.fieldEvidence;
+      existingDoc.processingPages = extraction.pages.map(({ page, method, status }) => ({ page, method, status }));
+      existingDoc.isSimulated = false;
 
       // 3. Create new DocumentVersionRecord
       const newVersionRecord: DocumentVersionRecord = {
@@ -580,16 +1014,38 @@ app.post(
         replacementReason,
         isActive: true,
         extractedFields: { ...existingDoc.extractedFields },
+        processingStatus: existingDoc.processingStatus,
+        geminiAnalysis: existingDoc.geminiAnalysis,
+        fieldEvidence: existingDoc.fieldEvidence,
+        processingPages: existingDoc.processingPages,
       };
       db.documentVersions.push(newVersionRecord);
 
       // 4. Synchronize FDR instrument if this is an FDR
       const fdrInst = db.fdrInstruments.find((f) => f.documentId === existingDoc.id);
       if (fdrInst) {
-        fdrInst.amount = existingDoc.extractedFields.financialAmount || fdrInst.amount;
-        fdrInst.fdrNumberNormalized = normalizeInstrumentNumber(existingDoc.extractedFields.fdrNumber || fdrInst.fdrNumberNormalized);
-        fdrInst.maturityDate = existingDoc.extractedFields.maturityDate || fdrInst.maturityDate;
-        fdrInst.isExpiringToday = fdrInst.maturityDate.slice(0, 10) === new Date().toISOString().slice(0, 10);
+        const { bankName, fdrNumber, holderName, financialAmount, currency, issueDate, maturityDate } =
+          existingDoc.extractedFields;
+        if (
+          bankName &&
+          fdrNumber &&
+          holderName &&
+          typeof financialAmount === 'number' &&
+          currency &&
+          issueDate &&
+          maturityDate
+        ) {
+          fdrInst.bankName = bankName;
+          fdrInst.fdrNumberNormalized = normalizeInstrumentNumber(fdrNumber);
+          fdrInst.holderName = holderName;
+          fdrInst.amount = financialAmount;
+          fdrInst.currency = currency;
+          fdrInst.issueDate = issueDate;
+          fdrInst.maturityDate = maturityDate;
+          fdrInst.isExpiringToday = maturityDate.slice(0, 10) === new Date().toISOString().slice(0, 10);
+        } else {
+          db.fdrInstruments.splice(db.fdrInstruments.indexOf(fdrInst), 1);
+        }
       }
 
       // 5. Mark affected findings for this document as REASSESSMENT_REQUIRED
@@ -609,6 +1065,7 @@ app.post(
         newVersion: existingDoc.version,
         newSha256,
         replacementReason,
+        geminiAnalysisStatus: geminiAnalysis.status,
       });
 
       // Automatically re-run validation rules
@@ -623,10 +1080,103 @@ app.post(
         findings: valResult.findings,
       });
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      console.error('Document replacement failed.');
+      res.status(500).json({ error: 'Failed to replace document.' });
     }
   }
 );
+
+app.post('/api/v1/documents/:id/gemini-analysis/retry', async (req: Request, res: Response) => {
+  const docRecord = db.documents.find((document) => document.id === req.params.id);
+  if (!docRecord) {
+    res.status(404).json({ error: 'Document not found' });
+    return;
+  }
+  if (
+    docRecord.mimeType !== 'application/pdf' ||
+    docRecord.isSimulated ||
+    docRecord.processingStatus !== 'PROCESSED'
+  ) {
+    res.status(400).json({
+      error: 'Gemini analysis retry requires a successfully extracted, stored PDF document.',
+    });
+    return;
+  }
+
+  const startingVersion = docRecord.version;
+  const startingSha256 = docRecord.sha256Hash;
+  try {
+    if (!fs.existsSync(docRecord.storageKey)) {
+      res.status(410).json({ error: 'The stored document is unavailable for re-analysis.' });
+      return;
+    }
+    const bytes = fs.readFileSync(docRecord.storageKey);
+    const actualSha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+    if (actualSha256 !== startingSha256) {
+      res.status(409).json({ error: 'The stored document has changed; analysis was not started.' });
+      return;
+    }
+
+    docRecord.geminiAnalysis = { status: 'PENDING' };
+    const extraction = await extractUploadedDocument({
+      path: docRecord.storageKey,
+      originalname: docRecord.originalFilename,
+      mimetype: docRecord.mimeType,
+    });
+    const analysis = await analyzeExtractedDocument(
+      extraction,
+      docRecord.documentType,
+      docRecord.mimeType
+    );
+    if (docRecord.version !== startingVersion || docRecord.sha256Hash !== startingSha256) {
+      res.status(409).json({
+        error: 'The document version changed during analysis. Retry on the current version.',
+      });
+      return;
+    }
+
+    docRecord.geminiAnalysis = analysis;
+    const versionRecord = db.documentVersions.find(
+      (version) =>
+        version.documentId === docRecord.id &&
+        version.versionNumber === startingVersion
+    );
+    if (versionRecord) {
+      versionRecord.geminiAnalysis = analysis;
+    }
+    db.logAuditEvent(currentUser, 'GEMINI_DOCUMENT_ANALYSIS', 'DOCUMENT', docRecord.id, {
+      version: startingVersion,
+      status: analysis.status,
+      errorCode: analysis.errorCode,
+    });
+    res.json({ success: true, geminiAnalysis: analysis });
+  } catch {
+    const analysis: GeminiDocumentAnalysis = {
+      status: 'FAILED',
+      errorCode: 'GEMINI_RETRY_FAILED',
+    };
+    if (docRecord.version === startingVersion && docRecord.sha256Hash === startingSha256) {
+      docRecord.geminiAnalysis = analysis;
+      const versionRecord = db.documentVersions.find(
+        (version) =>
+          version.documentId === docRecord.id &&
+          version.versionNumber === startingVersion
+      );
+      if (versionRecord) {
+        versionRecord.geminiAnalysis = analysis;
+      }
+      db.logAuditEvent(currentUser, 'GEMINI_DOCUMENT_ANALYSIS', 'DOCUMENT', docRecord.id, {
+        version: startingVersion,
+        status: analysis.status,
+        errorCode: analysis.errorCode,
+      });
+    }
+    res.status(503).json({
+      error: 'Document analysis could not be retried. Native PDF extraction remains unchanged.',
+      geminiAnalysis: analysis,
+    });
+  }
+});
 
 app.get('/api/v1/applications/:id/document-versions', (req: Request, res: Response) => {
   const versions = db.documentVersions.filter((v) => v.applicationId === req.params.id);
@@ -641,6 +1191,7 @@ app.get('/api/v1/applications/:id/audit-history', (req: Request, res: Response) 
 app.post(
   '/api/v1/applications/:id/documents',
   upload.single('file'),
+  validateUploadSignature,
   async (req: Request, res: Response) => {
     try {
       const appRecord = db.applications.find((a) => a.id === req.params.id);
@@ -656,14 +1207,37 @@ app.post(
 
       const fileBuffer = fs.readFileSync(req.file.path);
       const sha256Hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+      let extraction: DocumentExtractionResult;
+      try {
+        extraction = await extractUploadedDocument(req.file);
+      } catch (error) {
+        fs.unlinkSync(req.file.path);
+        if (error instanceof DocumentProcessorError) {
+          res.status(error.statusCode).json({ error: error.message, code: error.errorCode });
+          return;
+        }
+        throw error;
+      }
 
       const documentType = (req.body.documentType as DocumentType) || 'OTHER_EVIDENCE';
+      const geminiAnalysis = await analyzeExtractedDocument(
+        extraction,
+        documentType,
+        req.file.mimetype
+      );
       const title = req.body.title || req.file.originalname;
+      const extractedFields: ExtractedFields = {
+        ...extraction.fields,
+        ...(extraction.fields.expiryDate ? { maturityDate: extraction.fields.expiryDate } : {}),
+        rawTextPreview: extraction.rawTextPreview || undefined,
+        extractionMethod: extraction.extractionMethod,
+        ...(typeof extraction.extractionConfidence === 'number'
+          ? { extractionConfidence: extraction.extractionConfidence }
+          : {}),
+      };
 
-      const inst = db.institutions.find((i) => i.id === appRecord.institutionId);
-
-      const docRecord: any = {
-        id: `doc-${Date.now()}`,
+      const docRecord: DocumentRecord = {
+        id: `doc-${crypto.randomUUID()}`,
         applicationId: appRecord.id,
         documentType,
         title,
@@ -676,23 +1250,14 @@ app.post(
         uploadedAt: new Date().toISOString(),
         uploadedBy: currentUser.id,
         version: 1,
-        extractedFields: {
-          institutionName: appRecord.institutionName,
-          institutionIdentifier: inst?.permanentId,
-          registrationNumber: `REG-${Math.floor(100000 + Math.random() * 900000)}`,
-          issuingAuthority: 'Competent Statutory Authority',
-          issueDate: '2025-06-15',
-          expiryDate: '2027-06-14',
-          financialAmount: req.body.financialAmount ? parseFloat(req.body.financialAmount) : 3500000,
-          fdrNumber: req.body.fdrNumber || `FDR-${Date.now().toString().slice(-6)}`,
-          currency: 'INR',
-          extractionConfidence: 0.95,
-          extractionMethod: 'DIGITAL_TEXT',
-        },
-        processingStatus: 'PROCESSED',
-        pageCount: 2,
-        hasQrCode: true,
-        isSimulated: true,
+        extractedFields,
+        processingStatus: extraction.processingStatus,
+        geminiAnalysis,
+        pageCount: extraction.pageCount,
+        hasQrCode: false,
+        isSimulated: false,
+        fieldEvidence: extraction.fieldEvidence,
+        processingPages: extraction.pages.map(({ page, method, status }) => ({ page, method, status })),
         authenticityStatus: 'PENDING',
       };
 
@@ -714,23 +1279,38 @@ app.post(
         uploadedBy: currentUser.id,
         isActive: true,
         extractedFields: { ...docRecord.extractedFields },
+        processingStatus: docRecord.processingStatus,
+        geminiAnalysis: docRecord.geminiAnalysis,
+        fieldEvidence: docRecord.fieldEvidence,
+        processingPages: docRecord.processingPages,
       });
 
       // If document is FDR, register in fdrInstruments
-      if (documentType === 'FDR_OR_ENDOWMENT') {
+      const { bankName, fdrNumber, holderName, financialAmount, currency, issueDate, maturityDate } =
+        docRecord.extractedFields;
+      if (
+        documentType === 'FDR_OR_ENDOWMENT' &&
+        bankName &&
+        fdrNumber &&
+        holderName &&
+        typeof financialAmount === 'number' &&
+        currency &&
+        issueDate &&
+        maturityDate
+      ) {
         const fdrInst: FdrInstrument = {
           id: `fdr-${Date.now()}`,
           documentId: docRecord.id,
           applicationId: appRecord.id,
           institutionId: appRecord.institutionId,
-          bankName: req.body.bankName || 'Public Sector Bank',
-          fdrNumberNormalized: normalizeInstrumentNumber(docRecord.extractedFields.fdrNumber),
-          holderName: 'Chairman Trust and RO AICTE',
-          amount: docRecord.extractedFields.financialAmount || 3500000,
-          currency: 'INR',
-          issueDate: docRecord.extractedFields.issueDate || '2025-01-01',
-          maturityDate: docRecord.extractedFields.expiryDate || '2030-01-01',
-          isExpiringToday: false,
+          bankName,
+          fdrNumberNormalized: normalizeInstrumentNumber(fdrNumber),
+          holderName,
+          amount: financialAmount,
+          currency,
+          issueDate,
+          maturityDate,
+          isExpiringToday: maturityDate.slice(0, 10) === new Date().toISOString().slice(0, 10),
           authenticityStatus: 'PENDING',
           createdAt: new Date().toISOString(),
         };
@@ -744,11 +1324,13 @@ app.post(
         filename: req.file.originalname,
         sha256: sha256Hash,
         documentType,
+        geminiAnalysisStatus: geminiAnalysis.status,
       });
 
       res.status(201).json({ success: true, document: docRecord });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to process document upload' });
+      console.error('Document upload failed.');
+      res.status(500).json({ error: 'Failed to save document upload.' });
     }
   }
 );
@@ -974,6 +1556,11 @@ app.get('/api/v1/admin/audit-logs', (req: Request, res: Response) => {
 
 app.get('/api/v1/dashboard/metrics', (_req: Request, res: Response) => {
   const metrics = db.getDashboardMetrics();
+  metrics.potentialAnomaliesCount = db.applications.reduce(
+    (total, application) =>
+      total + anomalyDetector.detectAnomalies(db.documents.filter((doc) => doc.applicationId === application.id)).length,
+    0
+  );
   res.json({ metrics });
 });
 
@@ -1023,6 +1610,9 @@ app.get('/api/v1/applications/:id/report', (req: Request, res: Response) => {
       expiryDate: d.extractedFields.expiryDate,
       extractionConfidence: d.extractedFields.extractionConfidence,
       extractionMethod: d.extractedFields.extractionMethod,
+      processingStatus: d.processingStatus,
+      isSimulated: d.isSimulated,
+      fieldEvidence: d.fieldEvidence,
     })),
     ruleFindings: findings.map((f) => ({
       ruleId: f.ruleId,
@@ -1054,6 +1644,20 @@ app.get('/api/v1/applications/:id/report', (req: Request, res: Response) => {
 // VITE MIDDLEWARE & SERVER STARTUP
 // ==========================================
 
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/api/v1/applications/') && req.path.includes('/documents')) {
+    if (err instanceof multer.MulterError) {
+      res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof Error) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+  }
+  next(err);
+});
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -1073,7 +1677,11 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Server startup error:', err);
-  process.exit(1);
-});
+export { app };
+
+if (process.env.AICTE_TEST_MODE !== 'true') {
+  startServer().catch((err) => {
+    console.error('Server startup error:', err);
+    process.exit(1);
+  });
+}

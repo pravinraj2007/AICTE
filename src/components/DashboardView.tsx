@@ -113,10 +113,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   // Chart data: Verification outcomes
   const verificationChartData = [
-    { name: 'Simulated Verified', value: 8, color: '#16845B' },
-    { name: 'Pending Review', value: 4, color: '#B7791F' },
-    { name: 'Conflict / Mismatch', value: 2, color: '#C03945' },
-    { name: 'Source Unavailable', value: 1, color: '#64748B' },
+    {
+      name: 'Verified in Simulation — Not Official',
+      value: metrics.verificationOutcomes.VERIFIED_IN_SIMULATION,
+      color: '#16845B',
+    },
+    {
+      name: 'Pending Review',
+      value: metrics.verificationOutcomes.PENDING + metrics.verificationOutcomes.MANUAL_REVIEW_REQUIRED,
+      color: '#B7791F',
+    },
+    {
+      name: 'Conflict / Mismatch',
+      value: metrics.verificationOutcomes.MISMATCH_DETECTED + metrics.verificationOutcomes.EXPIRED,
+      color: '#C03945',
+    },
+    {
+      name: 'Source Unavailable',
+      value: metrics.verificationOutcomes.SOURCE_UNAVAILABLE,
+      color: '#64748B',
+    },
   ];
 
   return (
@@ -205,7 +221,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="text-2xl font-bold text-slate-900 mt-1.5 tabular-nums">
             {metrics.totalApplications}
           </div>
-          <div className="text-[10px] text-slate-500 mt-1">10 technical institutes</div>
+          <div className="text-[10px] text-slate-500 mt-1">{metrics.institutionCount} technical institutes</div>
         </div>
 
         {/* Card 2: Under Human Review */}
@@ -248,7 +264,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <FolderOpen className="w-4 h-4 text-blue-600" />
           </div>
           <div className="text-2xl font-bold text-blue-600 mt-1.5 tabular-nums">
-            {metrics.applicationsByStatus.VERIFICATION_PENDING || 2}
+            {metrics.applicationsByStatus.VERIFICATION_PENDING}
           </div>
           <div className="text-[10px] text-slate-500 mt-1">Awaiting bank/NOC</div>
         </div>
@@ -263,7 +279,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <ShieldAlert className="w-4 h-4 text-amber-600" />
           </div>
           <div className="text-2xl font-bold text-amber-600 mt-1.5 tabular-nums">
-            3
+            {metrics.potentialAnomaliesCount}
           </div>
           <div className="text-[10px] text-slate-500 mt-1">Tampering & Hash check</div>
         </div>
@@ -278,7 +294,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <AlertTriangle className="w-4 h-4 text-purple-600" />
           </div>
           <div className="text-2xl font-bold text-purple-600 mt-1.5 tabular-nums">
-            2
+            {metrics.openEscalationsCount || 0}
           </div>
           <div className="text-[10px] text-slate-500 mt-1">Same-day expiry & duplicate</div>
         </div>

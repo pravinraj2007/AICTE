@@ -348,7 +348,7 @@ export const InspectionDeskView: React.FC<InspectionDeskViewProps> = ({
                   </div>
                 </div>
                 <span className="text-[10px] bg-slate-100 font-mono px-2 py-0.5 rounded text-slate-600">
-                  {selectedDoc.isSimulated ? 'SIMULATED DATA' : 'OFFICIAL'}
+                  {selectedDoc.isSimulated ? 'SEEDED DEMO DATA' : 'NOT OFFICIALLY VERIFIED'}
                 </span>
               </div>
             )}
@@ -375,9 +375,13 @@ export const InspectionDeskView: React.FC<InspectionDeskViewProps> = ({
             {/* OCR Transcript */}
             <div className="bg-white p-4 rounded border border-slate-200 space-y-2 font-mono text-[11px] text-slate-800 shadow-2xs">
               <div className="flex items-center justify-between pb-2 border-b border-slate-100 font-sans">
-                <span className="font-semibold text-xs text-slate-900">Extracted Transcript</span>
-                <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  Confidence: {((selectedDoc?.extractedFields.extractionConfidence || 0.95) * 100).toFixed(0)}%
+                <span className="font-semibold text-xs text-slate-900">Extracted Text Preview</span>
+                <span className="text-[10px] text-slate-700 bg-slate-50 px-2 py-0.5 rounded border border-slate-200">
+                  {selectedDoc?.isSimulated
+                    ? 'Seeded demo value'
+                    : `Confidence: ${typeof selectedDoc?.extractedFields.extractionConfidence === 'number'
+                      ? `${(selectedDoc.extractedFields.extractionConfidence * 100).toFixed(0)}%`
+                      : 'Not reported'}`}
                 </span>
               </div>
               <div className="p-3 bg-amber-50/30 border border-amber-200/60 rounded text-slate-900 leading-relaxed whitespace-pre-wrap">

@@ -115,8 +115,8 @@ export interface ExtractedFields {
   qrCodePayload?: string;
   relevantPageNumber?: number;
   rawTextPreview?: string;
-  extractionConfidence: number; // 0 to 1
-  extractionMethod: 'DIGITAL_TEXT' | 'TESSERACT_OCR' | 'GEMINI_ASSISTED' | 'HYBRID';
+  extractionConfidence?: number; // 0 to 1, only when provided by the extraction engine
+  extractionMethod: 'NONE' | 'DIGITAL_TEXT' | 'PDF_TEXT_EXTRACTION' | 'TESSERACT_OCR' | 'GEMINI_ASSISTED' | 'GEMINI_DOCUMENT_ANALYSIS' | 'HYBRID' | 'HYBRID_EXTRACTION';
 
   // Financial & FDR specific fields
   bankName?: string;
@@ -129,6 +129,28 @@ export interface ExtractedFields {
   pdfProducer?: string;
   pdfModificationTimestamp?: string;
   suspiciousIndicators?: string[];
+}
+
+export interface GeminiDocumentAnalysisResult {
+  documentType: DocumentType | 'UNKNOWN';
+  institutionName: string | null;
+  certificateNumber: string | null;
+  issuingAuthority: string | null;
+  issueDate: string | null;
+  expiryDate: string | null;
+  missingFields: string[];
+  inconsistencies: string[];
+  warnings: string[];
+  summary: string;
+}
+
+export interface GeminiDocumentAnalysis {
+  status: 'PENDING' | 'COMPLETED' | 'FAILED';
+  model?: string;
+  analyzedAt?: string;
+  errorCode?: string;
+  inputTextTruncated?: boolean;
+  result?: GeminiDocumentAnalysisResult;
 }
 
 export interface DocumentRecord {
@@ -146,7 +168,10 @@ export interface DocumentRecord {
   uploadedBy: string;
   version: number;
   extractedFields: ExtractedFields;
-  processingStatus: 'PENDING' | 'PROCESSED' | 'FAILED';
+  processingStatus: 'PENDING' | 'PROCESSED' | 'FAILED' | 'MANUAL_REVIEW_REQUIRED';
+  fieldEvidence?: Record<string, Array<{ page: number; text: string }>>;
+  processingPages?: Array<{ page: number; method: string; status: string }>;
+  geminiAnalysis?: GeminiDocumentAnalysis;
   pageCount: number;
   hasQrCode: boolean;
   isSimulated: boolean;
@@ -169,6 +194,10 @@ export interface DocumentVersionRecord {
   replacementReason?: string;
   isActive: boolean;
   extractedFields: ExtractedFields;
+  processingStatus?: 'PENDING' | 'PROCESSED' | 'FAILED' | 'MANUAL_REVIEW_REQUIRED';
+  fieldEvidence?: Record<string, Array<{ page: number; text: string }>>;
+  processingPages?: Array<{ page: number; method: string; status: string }>;
+  geminiAnalysis?: GeminiDocumentAnalysis;
 }
 
 export interface FdrInstrument {
@@ -394,15 +423,18 @@ export interface DocumentChecklistItem {
 
 export interface DashboardMetrics {
   totalApplications: number;
+  institutionCount: number;
   applicationsByStatus: Record<ApplicationStatus, number>;
   applicationsByCategory: Record<ApplicationCategory, number>;
   openFindingsCount: number;
   findingsBySeverity: Record<FindingSeverity, number>;
+  verificationOutcomes: Record<VerificationResult, number>;
   pendingVerifications: number;
   applicationsRequiringReview: number;
   completedValidations: number;
-  averageComplianceScore: number;
+  averageComplianceScore: number | null;
   syntheticDataNotice: string;
+  potentialAnomaliesCount: number;
   openEscalationsCount?: number;
   duplicateConflictCount?: number;
 }

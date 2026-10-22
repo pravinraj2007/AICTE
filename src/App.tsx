@@ -15,6 +15,7 @@ import { CreateApplicationModal } from './components/CreateApplicationModal.tsx'
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [demoRoleSwitchEnabled, setDemoRoleSwitchEnabled] = useState(false);
   const [activeNav, setActiveNav] = useState<string>('dashboard');
   const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
   const [reportAppId, setReportAppId] = useState<string | null>(null);
@@ -27,6 +28,7 @@ export default function App() {
       .getMe()
       .then((res) => {
         setCurrentUser(res.user);
+        setDemoRoleSwitchEnabled(res.demoRoleSwitchEnabled);
       })
       .catch((err) => {
         console.error('Failed to get current user session', err);
@@ -99,6 +101,7 @@ export default function App() {
   return (
     <AppShell
       currentUser={currentUser}
+      demoRoleSwitchEnabled={demoRoleSwitchEnabled}
       onUserChanged={(u) => {
         setCurrentUser(u);
         addToast({
@@ -115,12 +118,23 @@ export default function App() {
         }
       }}
       breadcrumbs={getBreadcrumbs()}
-      unreadNotificationCount={3}
+      unreadNotificationCount={0}
       onOpenNewApplication={() => setShowCreateAppModal(true)}
     >
       {/* Toast Notification Container */}
       <ToastNotification toasts={toasts} onDismiss={handleDismissToast} />
 
+      {!currentUser ? (
+        <section className="mx-auto mt-16 max-w-2xl rounded-xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+          <h1 className="text-xl font-semibold text-slate-900">Authentication required</h1>
+          <p className="mt-3 text-sm text-slate-600">
+            {demoRoleSwitchEnabled
+              ? 'Choose a local synthetic identity from the role selector to continue.'
+              : 'Sign in through the configured identity provider to access applications and documents.'}
+          </p>
+        </section>
+      ) : (
+      <>
       {/* Primary Workspace Route Routing */}
       {activeNav === 'dashboard' && (
         <DashboardView
@@ -188,10 +202,12 @@ export default function App() {
             addToast({
               type: 'SUCCESS',
               title: 'Application Created Successfully',
-              message: `Regulatory application record ${appId} persisted in database.`,
+              message: `Regulatory application record ${appId} created in this prototype session.`,
             });
           }}
         />
+      )}
+      </>
       )}
     </AppShell>
   );

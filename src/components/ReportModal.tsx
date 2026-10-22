@@ -53,7 +53,7 @@ export const ReportModal: React.FC<ReportModalProps> = ({ applicationId, onClose
         <div className="p-4 bg-slate-900 text-white flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-5 h-5 text-amber-400" />
-            <span className="text-sm font-semibold">AICTE Statutory Validation Scrutiny Report</span>
+            <span className="text-sm font-semibold">Prototype Document-Validation Report</span>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -83,16 +83,16 @@ export const ReportModal: React.FC<ReportModalProps> = ({ applicationId, onClose
               {/* Official Letterhead */}
               <div className="text-center pb-4 border-b-2 border-[#0f294a] space-y-1">
                 <div className="text-base font-bold tracking-tight text-[#0f294a] uppercase">
-                  All India Council for Technical Education
+                  AICTE Regulatory Validation Platform
                 </div>
                 <div className="text-xs font-semibold text-slate-700">
-                  (A Statutory Body of the Government of India) · Regulation Bureau
+                  Prototype demonstration — not an AICTE-issued document
                 </div>
                 <div className="text-[11px] text-slate-500">
                   Nelson Mandela Marg, Vasant Kunj, New Delhi - 110070
                 </div>
                 <div className="text-xs font-bold text-amber-800 bg-amber-50 py-1 px-4 rounded-full inline-block mt-2 border border-amber-200">
-                  TECHNICAL SCRUTINY & REGULATORY COMPLIANCE AUDIT REPORT
+                  NON-OFFICIAL · FOR EVALUATION ONLY
                 </div>
               </div>
 
@@ -136,7 +136,13 @@ export const ReportModal: React.FC<ReportModalProps> = ({ applicationId, onClose
                           <td className="p-2 font-sans text-slate-600">{doc.type}</td>
                           <td className="p-2">{doc.extractedPID || '—'}</td>
                           <td className="p-2">{doc.expiryDate || 'PERPETUAL'}</td>
-                          <td className="p-2 font-sans">{(doc.extractionConfidence * 100).toFixed(0)}% ({doc.extractionMethod})</td>
+                          <td className="p-2 font-sans">
+                            {doc.isSimulated
+                              ? 'Seeded demo value'
+                              : typeof doc.extractionConfidence === 'number'
+                              ? `${(doc.extractionConfidence * 100).toFixed(0)}% (${doc.extractionMethod})`
+                              : `Not reported (${doc.extractionMethod || 'no extraction'})`}
+                          </td>
                           <td className="p-2 text-slate-500 truncate max-w-[120px]">{doc.sha256}</td>
                         </tr>
                       ))}

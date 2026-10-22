@@ -1,17 +1,6 @@
 version: '3.8'
 
 services:
-  mongodb:
-    image: mongo:7.0
-    container_name: aicte-mongodb
-    restart: always
-    ports:
-      - "27017:27017"
-    environment:
-      MONGO_INITDB_DATABASE: aicte_validation
-    volumes:
-      - mongo_data:/data/db
-
   backend:
     build:
       context: .
@@ -21,10 +10,17 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MONGODB_URL=mongodb://mongodb:27017/aicte_validation
-      - ENVIRONMENT=production
-    depends_on:
-      - mongodb
+      AICTE_DATABASE_PATH: /data/aicte.sqlite
+      DOCUMENT_STORAGE_PATH: /data/documents
+      ENVIRONMENT: production
+      DOCUMENT_PROCESSOR_TOKEN: ${DOCUMENT_PROCESSOR_TOKEN:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
+      OIDC_SUBJECT_USER_MAP: "${OIDC_SUBJECT_USER_MAP:-}"
+      AICTE_DEMO_ROLE_SWITCH_ENABLED: "false"
+    volumes:
+      - platform_data:/data
 
   frontend:
     build:
@@ -34,8 +30,22 @@ services:
     restart: always
     ports:
       - "3000:3000"
+    environment:
+      AICTE_DATABASE_PATH: /data/aicte.sqlite
+      DOCUMENT_STORAGE_PATH: /data/documents
+      DOCUMENT_PROCESSOR_URL: http://backend:8000
+      DOCUMENT_PROCESSOR_TOKEN: ${DOCUMENT_PROCESSOR_TOKEN:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
+      OIDC_SUBJECT_USER_MAP: "${OIDC_SUBJECT_USER_MAP:-}"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      AICTE_DEMO_ROLE_SWITCH_ENABLED: "false"
+    volumes:
+      - platform_data:/data
     depends_on:
       - backend
 
 volumes:
-  mongo_data:
+  platform_data:

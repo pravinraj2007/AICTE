@@ -5,6 +5,7 @@ import { ShieldCheck, UserCheck, AlertTriangle, Layers, Building2, SearchCheck, 
 
 interface HeaderProps {
   currentUser: User | null;
+  demoRoleSwitchEnabled: boolean;
   onUserChanged: (user: User) => void;
   activeTab: string;
   onSelectTab: (tab: string) => void;
@@ -12,6 +13,7 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({
   currentUser,
+  demoRoleSwitchEnabled,
   onUserChanged,
   activeTab,
   onSelectTab,
@@ -20,8 +22,10 @@ export const Header: React.FC<HeaderProps> = ({
   const [users, setUsers] = useState<User[]>([]);
 
   useEffect(() => {
-    api.getUsers().then((res) => setUsers(res.users)).catch(console.error);
-  }, []);
+    if (demoRoleSwitchEnabled) {
+      api.getUsers().then((res) => setUsers(res.users)).catch(console.error);
+    }
+  }, [demoRoleSwitchEnabled]);
 
   const handleSwitchUser = async (userId: string) => {
     try {
@@ -51,7 +55,7 @@ export const Header: React.FC<HeaderProps> = ({
       {/* Top Disclaimer Banner */}
       <div className="bg-slate-900 text-slate-300 text-xs py-1.5 px-6 border-b border-slate-800 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="font-semibold text-amber-400">OFFICIAL PROTOTYPE</span>
+          <span className="font-semibold text-amber-400">PROTOTYPE ONLY</span>
           <span className="text-slate-500">·</span>
           <span>All India Council for Technical Education · Regulation Bureau</span>
           <span className="text-slate-500">·</span>
@@ -87,14 +91,14 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Zone 2: 4-5 clean single-line text navigation links */}
           <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600">
-            <button
+            {demoRoleSwitchEnabled && <button
               onClick={() => onSelectTab('dashboard')}
               className={`hover:text-[#0f294a] transition-colors whitespace-nowrap shrink-0 pb-0.5 ${
                 activeTab === 'dashboard' ? 'text-[#0f294a] font-semibold border-b-2 border-[#0f294a]' : ''
               }`}
             >
               Dashboard
-            </button>
+            </button>}
             <button
               onClick={() => onSelectTab('applications')}
               className={`hover:text-[#0f294a] transition-colors whitespace-nowrap shrink-0 pb-0.5 ${
@@ -149,7 +153,7 @@ export const Header: React.FC<HeaderProps> = ({
       </header>
 
       {/* Role Switcher Modal */}
-      {showSwitchModal && (
+      {demoRoleSwitchEnabled && showSwitchModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-lg shadow-xl max-w-lg w-full border border-slate-200 overflow-hidden">
             <div className="p-4 bg-slate-900 text-white flex items-center justify-between">
